@@ -1,0 +1,1 @@
+ALTER TABLE "chat_messages" ADD COLUMN "reply_to_top_id" text DEFAULT '' NOT NULL;

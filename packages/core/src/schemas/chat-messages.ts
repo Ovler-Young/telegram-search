@@ -26,6 +26,7 @@ export const chatMessagesTable = pgTable('chat_messages', {
   is_reply: boolean().notNull().default(false),
   reply_to_name: text().notNull().default(''),
   reply_to_id: text().notNull().default(''),
+  reply_to_top_id: text().notNull().default(''),
   forward: jsonb().$type<CoreMessageForward>().notNull().default({ isForward: false }),
   media: jsonb().$type<CoreMessageMedia[]>().notNull().default([]),
   links: jsonb().$type<CoreMessageLink[]>().notNull().default([]),

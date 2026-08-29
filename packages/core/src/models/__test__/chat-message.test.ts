@@ -105,6 +105,50 @@ describe('models/chat-message', () => {
     expect(groupRow.owner_account_id).toBeNull()
   })
 
+  it('fills reply and forum topic IDs when an existing message is resynced', async () => {
+    const db = await setupDb()
+    const [account] = await db.insert(accountsTable).values({
+      platform: 'telegram',
+      platform_user_id: 'user-1',
+    }).returning()
+    const [chat] = await db.insert(joinedChatsTable).values({
+      platform: 'telegram',
+      chat_id: 'forum-1',
+      chat_name: 'Forum',
+      chat_type: 'group',
+    }).returning()
+    const message = buildCoreMessage({
+      platformMessageId: '42',
+      chatId: chat.chat_id,
+    })
+
+    await chatMessageModels.recordMessages(db, account.id, [message])
+    await chatMessageModels.recordMessages(db, account.id, [{
+      ...message,
+      reply: {
+        isReply: true,
+        replyToId: '41',
+        replyToTopId: '10',
+      },
+    }])
+
+    const [stored] = await db.select().from(chatMessagesTable)
+    expect(stored).toMatchObject({
+      is_reply: true,
+      reply_to_id: '41',
+      reply_to_top_id: '10',
+    })
+
+    const fetched = (await chatMessageModels.fetchMessages(db, account.id, chat.chat_id, {
+      limit: 10,
+      offset: 0,
+    })).unwrap()
+    expect(fetched.coreMessages[0].reply).toMatchObject({
+      replyToId: '41',
+      replyToTopId: '10',
+    })
+  })
+
   it('fetchMessages enforces ACL and returns messages ordered by created_at desc', async () => {
     const db = await setupDb()
 

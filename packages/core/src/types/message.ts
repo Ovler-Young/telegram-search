@@ -32,6 +32,7 @@ export type ProcessedCoreMessage = CoreMessage & {
 export interface CoreMessageReply {
   isReply: boolean
   replyToId?: string
+  replyToTopId?: string
   replyToName?: string
 }
 

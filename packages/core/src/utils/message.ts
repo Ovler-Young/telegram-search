@@ -63,6 +63,9 @@ export function convertToCoreMessage(message: Api.Message): Result<CoreMessage> 
   const reply: CoreMessageReply = {
     isReply: !!message.replyTo,
     replyToId: message.replyTo?.replyToMsgId?.toString(),
+    replyToTopId: message.replyTo instanceof Api.MessageReplyHeader
+      ? message.replyTo.replyToTopId?.toString()
+      : undefined,
     replyToName: undefined, // Needs async user lookup
   }
 

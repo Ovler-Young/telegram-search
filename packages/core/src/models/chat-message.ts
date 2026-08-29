@@ -98,6 +98,10 @@ async function recordMessages(
         forward: sql`excluded.forward`,
         media: sql`excluded.media`,
         links: sql`excluded.links`,
+        is_reply: sql`excluded.is_reply`,
+        reply_to_name: sql`excluded.reply_to_name`,
+        reply_to_id: sql`excluded.reply_to_id`,
+        reply_to_top_id: sql`excluded.reply_to_top_id`,
 
         // User UUID: update if not null
         from_user_uuid: sql`COALESCE(excluded.from_user_uuid, ${chatMessagesTable.from_user_uuid})`,

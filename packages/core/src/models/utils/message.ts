@@ -29,6 +29,7 @@ export function convertToCoreMessageFromDB(message: DBSelectMessage): CoreMessag
     reply: {
       isReply: message.is_reply,
       replyToId: message.reply_to_id,
+      replyToTopId: message.reply_to_top_id,
       replyToName: message.reply_to_name,
     },
     forward: message.forward,
@@ -58,6 +59,7 @@ export function convertToDBInsertMessage(
     is_reply: message.reply.isReply,
     reply_to_name: message.reply.replyToName,
     reply_to_id: message.reply.replyToId,
+    reply_to_top_id: message.reply.replyToTopId,
     forward: message.forward,
     media: message.media ?? [],
     links: message.links ?? [],
