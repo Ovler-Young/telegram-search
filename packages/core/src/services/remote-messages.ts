@@ -21,6 +21,7 @@ export function coreMessageToRecord(message: CoreMessage): MessageRecord {
     timestamp: message.platformTimestamp,
     text: message.content,
     replyToId: message.reply.replyToId,
+    replyToTopId: message.reply.replyToTopId,
     forward: {
       isForward: message.forward.isForward,
       fromChatId: message.forward.forwardFromChatId,

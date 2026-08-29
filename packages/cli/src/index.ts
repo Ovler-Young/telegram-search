@@ -4,6 +4,7 @@ import type { OutputMeta } from './output'
 
 import process from 'node:process'
 
+import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
@@ -58,6 +59,62 @@ function parseTimestamp(value: string | undefined): number | undefined {
 function parseChatIds(value: string | undefined): string[] | undefined {
   const ids = value?.split(',').map(item => item.trim()).filter(Boolean)
   return ids?.length ? ids : undefined
+}
+
+export function parseRecoveryChatFile(content: string): string[] {
+  const chatIds = new Map<string, true>()
+  for (const [index, sourceLine] of content.split(/\r?\n/).entries()) {
+    const commentIndex = sourceLine.indexOf('#')
+    const value = (commentIndex === -1 ? sourceLine : sourceLine.slice(0, commentIndex)).trim()
+    if (!value)
+      continue
+    if (!/^-?\d+$/.test(value))
+      throw new Error(`Invalid Telegram chat ID on line ${index + 1}: ${value}`)
+    const canonical = BigInt(value).toString()
+    if (canonical === '0')
+      throw new Error(`Telegram chat ID on line ${index + 1} must not be zero`)
+    chatIds.set(canonical, true)
+  }
+  if (chatIds.size === 0)
+    throw new Error('Chat file does not contain any Telegram chat IDs')
+  return [...chatIds.keys()]
+}
+
+const RECOVERY_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|([+-])(\d{2}):(\d{2}))$/
+
+export function parseRecoveryTimestamp(value: string, option: '--from' | '--to'): number {
+  const match = RECOVERY_TIMESTAMP.exec(value)
+  if (!match)
+    throw new Error(`${option} requires an ISO 8601 timestamp with an explicit timezone offset`)
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0', fractionText = '', zone, sign, offsetHourText = '0', offsetMinuteText = '0'] = match
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  const second = Number(secondText)
+  const millisecond = Number(fractionText.padEnd(3, '0'))
+  const offsetHour = Number(offsetHourText)
+  const offsetMinute = Number(offsetMinuteText)
+  if (offsetHour > 23 || offsetMinute > 59)
+    throw new Error(`Invalid timestamp for ${option}: ${value}`)
+  const offset = zone === 'Z' ? 0 : (sign === '-' ? -1 : 1) * (offsetHour * 60 + offsetMinute)
+  const localMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond)
+  const parsed = localMs - offset * 60_000
+  const normalized = new Date(parsed + offset * 60_000)
+  if (
+    normalized.getUTCFullYear() !== year
+    || normalized.getUTCMonth() !== month - 1
+    || normalized.getUTCDate() !== day
+    || normalized.getUTCHours() !== hour
+    || normalized.getUTCMinutes() !== minute
+    || normalized.getUTCSeconds() !== second
+    || normalized.getUTCMilliseconds() !== millisecond
+  ) {
+    throw new Error(`Invalid timestamp for ${option}: ${value}`)
+  }
+  return parsed
 }
 
 export function resolveExportOutputPath(output: string | undefined, defaultPath: string): string {
@@ -500,6 +557,43 @@ const exportCommand = defineCommand({
   },
 })
 
+const recoveryCommand = defineCommand({
+  meta: { name: 'recovery', description: 'Export bounded owner-account Telegram history for recovery' },
+  subCommands: {
+    export: defineCommand({
+      meta: { name: 'export', description: 'Export selected group messages to versioned recovery JSONL' },
+      args: {
+        'chat-file': { type: 'string', required: true },
+        'from': { type: 'string', required: true },
+        'to': { type: 'string', required: true },
+        'output': { type: 'string', required: true },
+        'takeout': { type: 'boolean', default: false },
+        ...profileArg,
+      },
+      async run(context) {
+        const profile = profileFrom(context)
+        const fromMs = parseRecoveryTimestamp(stringArg(context.args.from), '--from')
+        const toMs = parseRecoveryTimestamp(stringArg(context.args.to), '--to')
+        if (fromMs >= toMs)
+          throw new Error('Recovery export requires --from to be earlier than --to')
+        const chatFile = resolve(stringArg(context.args['chat-file']))
+        const topicChatIds = parseRecoveryChatFile(await readFile(chatFile, 'utf8'))
+        const outputFile = resolve(stringArg(context.args.output))
+        await withRuntime(profile, true, async (runtime) => {
+          await emitStreamResult(runtime.streams.recoveryExport({
+            profile,
+            topicChatIds,
+            fromMs,
+            toMs,
+            outputFile,
+            takeout: context.args.takeout === true,
+          }), outputMeta(profile, 'telegram'))
+        })
+      },
+    }),
+  },
+})
+
 export const main = defineCommand({
   meta: { name: 'tg-search', version: CLI_VERSION, description: 'Agent-friendly local Telegram search and export CLI' },
   args: profileArg,
@@ -514,6 +608,7 @@ export const main = defineCommand({
     stats: statsCommand,
     sync: syncCommand,
     export: exportCommand,
+    recovery: recoveryCommand,
   },
 })
 

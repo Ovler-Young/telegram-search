@@ -447,6 +447,7 @@ export interface TakeoutEventFromCore {
 export interface TakeoutOpts {
   chatId: string
   pagination: CorePagination
+  inputPeer?: Api.TypeInputPeer
 
   // Unix timestamp in milliseconds
   startTime?: number

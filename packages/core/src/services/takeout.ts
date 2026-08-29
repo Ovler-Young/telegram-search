@@ -79,8 +79,8 @@ export function createTakeoutService(
 
   const TAKEOUT_INIT_TIMEOUT_MS = 30_000
 
-  async function resolveTakeoutMessageFlags(chatId: string) {
-    const peer = await entityService.getInputPeer(chatId)
+  async function resolveTakeoutMessageFlags(chatId: string, inputPeer?: Api.TypeInputPeer) {
+    const peer = inputPeer ?? await entityService.getInputPeer(chatId)
     if (peer instanceof Api.InputPeerUser) {
       return { messageUsers: true }
     }
@@ -98,10 +98,10 @@ export function createTakeoutService(
     throw new Error(`Unsupported Telegram peer for takeout: ${peer.className}`)
   }
 
-  async function initTakeout(chatId: string): Promise<Api.account.Takeout> {
+  async function initTakeout(chatId: string, inputPeer?: Api.TypeInputPeer): Promise<Api.account.Takeout> {
     return withSpan('takeout:initSession', async () => {
       logger.log('Initializing takeout session...')
-      const messageFlags = await resolveTakeoutMessageFlags(chatId)
+      const messageFlags = await resolveTakeoutMessageFlags(chatId, inputPeer)
 
       const invokePromise = ctx.getClient().invoke(new Api.account.InitTakeoutSession({
         contacts: false,
@@ -172,8 +172,8 @@ export function createTakeoutService(
 
   async function getHistoryWithMessagesCount(chatId: EntityLike): Promise<Result<Api.messages.TypeMessages & { count: number }>> {
     try {
-      // Resolve peer via entityService to get the correct InputPeer type and accessHash
-      // from the DB, avoiding misidentification (e.g. channel treated as PeerUser).
+      // A caller that validated a marked Telegram ID can retain its resolved
+      // peer type here; other callers continue through the account entity cache.
       const peer = await entityService.getInputPeer(chatId as string | number)
       const history = await retryTelegramRead(() => ctx.getClient()
         .invoke(new Api.messages.GetHistory({
@@ -257,12 +257,14 @@ export function createTakeoutService(
       }
       // Resolve peer via entityService to get the correct InputPeer type and accessHash
       // from the DB, avoiding misidentification (e.g. channel treated as PeerUser).
-      const peer = await entityService.getInputPeer(chatId)
+      const peer = options.inputPeer ?? await entityService.getInputPeer(chatId)
       const historyQuery = new Api.messages.GetHistory({
         peer,
         offsetId,
         addOffset: 0,
-        offsetDate: 0,
+        // GetHistory treats offsetDate as exclusive. The Takeout service's
+        // endTime contract is inclusive, so advance to the following second.
+        offsetDate: options.endTime === undefined ? 0 : Math.floor(options.endTime / 1000) + 1,
         limit,
         maxId,
         minId,
@@ -328,10 +330,10 @@ export function createTakeoutService(
         }
 
         // Time range filtering
-        if (options.endTime && message.date > options.endTime / 1000) {
+        if (options.endTime !== undefined && message.date > options.endTime / 1000) {
           continue
         }
-        if (options.startTime && message.date < options.startTime / 1000) {
+        if (options.startTime !== undefined && message.date < options.startTime / 1000) {
           hasMore = false
           break
         }
@@ -375,7 +377,7 @@ export function createTakeoutService(
 
     let takeoutSession: Api.account.Takeout
     try {
-      takeoutSession = await initTakeout(chatId)
+      takeoutSession = await initTakeout(chatId, options.inputPeer)
     }
     catch (error) {
       task.updateError(error)

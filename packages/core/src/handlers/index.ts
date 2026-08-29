@@ -5,6 +5,7 @@ import type { TelegramApplication } from '../application/runtime'
 import { registerChatHandlers } from './chats'
 import { registerExportHandler } from './export'
 import { registerMessageHandlers } from './messages'
+import { registerRecoveryHandler } from './recovery'
 import { registerStatsHandler } from './stats'
 import { registerSyncHandler } from './sync'
 
@@ -19,6 +20,12 @@ export function registerApplicationHandlers(context: EventContext<any, any>, app
     registerExportHandler(context, {
       ...application,
       exportLocal: application.exportLocal,
+    })
+  }
+  if (application.exportRecovery) {
+    registerRecoveryHandler(context, {
+      ...application,
+      exportRecovery: application.exportRecovery,
     })
   }
   return () => {

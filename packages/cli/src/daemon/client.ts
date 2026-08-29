@@ -10,6 +10,7 @@ import {
   daemonContracts,
   exportContracts,
   messageContracts,
+  recoveryContracts,
   statsContracts,
   syncContracts,
 } from '@tg-search/protocol'
@@ -52,6 +53,7 @@ export async function connectDaemon(paths: ProfilePaths): Promise<DaemonClientRu
           },
           streams: {
             export: defineStreamInvoke(connection.context, exportContracts.run),
+            recoveryExport: defineStreamInvoke(connection.context, recoveryContracts.export),
             sync: defineStreamInvoke(connection.context, syncContracts.run),
           },
           close: () => connection.dispose(),

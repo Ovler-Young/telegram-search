@@ -26,6 +26,7 @@ function buildDBSelectMessage(overrides: Partial<DBSelectMessage> = {}): DBSelec
     is_reply: overrides.is_reply ?? false,
     reply_to_name: overrides.reply_to_name ?? '',
     reply_to_id: overrides.reply_to_id ?? '',
+    reply_to_top_id: overrides.reply_to_top_id ?? '',
     forward: overrides.forward ?? { isForward: false },
     media: overrides.media ?? [],
     links: overrides.links ?? [],
@@ -76,6 +77,7 @@ describe('models/utils/message', () => {
         content: 'hello world',
         is_reply: true,
         reply_to_id: '21',
+        reply_to_top_id: '10',
         reply_to_name: 'Reply To',
         forward: {
           isForward: true,
@@ -102,6 +104,7 @@ describe('models/utils/message', () => {
       expect(core.content).toBe('hello world')
       expect(core.reply.isReply).toBe(true)
       expect(core.reply.replyToId).toBe('21')
+      expect(core.reply.replyToTopId).toBe('10')
       expect(core.reply.replyToName).toBe('Reply To')
       expect(core.forward).toEqual(dbMessage.forward)
       expect(core.media).toEqual(dbMessage.media)
@@ -132,7 +135,7 @@ describe('models/utils/message', () => {
         fromId: 'from-1',
         fromName: 'From 1',
         content: 'some-content',
-        reply: { isReply: false, replyToId: undefined, replyToName: undefined },
+        reply: { isReply: false, replyToId: undefined, replyToTopId: undefined, replyToName: undefined },
         platformTimestamp: 999,
       })
 
@@ -150,6 +153,7 @@ describe('models/utils/message', () => {
       expect(dbInsert.content).toBe(core.content)
       expect(dbInsert.is_reply).toBe(false)
       expect(dbInsert.reply_to_id).toBeUndefined()
+      expect(dbInsert.reply_to_top_id).toBeUndefined()
       expect(dbInsert.reply_to_name).toBeUndefined()
       expect(dbInsert.platform_timestamp).toBe(999)
       expect(dbInsert.owner_account_id).toBe(ownerAccountId)

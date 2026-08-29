@@ -71,6 +71,7 @@ export interface MessageRecord {
   timestamp: number
   text: string
   replyToId?: string
+  replyToTopId?: string
   forward: MessageForwardRecord
   media: MessageMediaRecord[]
   links: MessageLinkRecord[]

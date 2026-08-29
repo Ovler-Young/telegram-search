@@ -56,7 +56,11 @@ export const useMessageStore = defineStore('message', () => {
       fromId: message.senderId,
       fromName: message.senderName,
       content: message.text,
-      reply: { isReply: !!message.replyToId, replyToId: message.replyToId },
+      reply: {
+        isReply: !!message.replyToId,
+        replyToId: message.replyToId,
+        replyToTopId: message.replyToTopId,
+      },
       forward: {
         isForward: message.forward.isForward,
         forwardFromChatId: message.forward.fromChatId,

@@ -1,0 +1,142 @@
+name: telegram-search-recovery
+
+x-recovery-build: &recovery-build
+  context: ..
+  dockerfile: docker/Dockerfile
+  target: recovery
+  args:
+    ETM_IMPORTER_REF: ${ETM_IMPORTER_REF:-db843a01ebc4bb399277c4614c39a6ee159c89e4}
+    ETM_PROFILE: ${RECOVERY_PROFILE:-recovery}
+
+x-owner-environment: &owner-environment
+  TG_SEARCH_HOME: /var/lib/tg-search
+  RECOVERY_PROFILE: ${RECOVERY_PROFILE:-recovery}
+  TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+  TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+
+x-chat-file: &chat-file
+  type: bind
+  source: ${RECOVERY_CHAT_FILE:-../recovery/chat-ids.txt}
+  target: /recovery/chat-ids.txt
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-artifact-directory: &artifact-directory
+  type: bind
+  source: ${RECOVERY_ARTIFACT_DIR:-../recovery}
+  target: /recovery
+  bind:
+    create_host_path: false
+
+x-etm-config: &etm-config
+  type: bind
+  source: ${RECOVERY_ETM_CONFIG_FILE:-../recovery/etm-config.yaml}
+  target: /var/lib/efb/profiles/${RECOVERY_PROFILE:-recovery}/blueset.telegram/config.yaml
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  recovery-auth:
+    profiles: [recovery]
+    build: *recovery-build
+    environment: *owner-environment
+    volumes:
+      - recovery_owner_data:/var/lib/tg-search
+    stdin_open: true
+    tty: true
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        : "$${TELEGRAM_API_ID:?Set TELEGRAM_API_ID}"
+        : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
+        exec tg-search --profile "$${RECOVERY_PROFILE}" auth login
+
+  recovery-export:
+    profiles: [recovery]
+    build: *recovery-build
+    environment:
+      <<: *owner-environment
+      RECOVERY_FROM: ${RECOVERY_FROM:-}
+      RECOVERY_TO: ${RECOVERY_TO:-}
+      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
+    volumes:
+      - recovery_owner_data:/var/lib/tg-search
+      - *chat-file
+      - *artifact-directory
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        : "$${TELEGRAM_API_ID:?Set TELEGRAM_API_ID}"
+        : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
+        : "$${RECOVERY_FROM:?Set RECOVERY_FROM to an ISO 8601 timestamp}"
+        : "$${RECOVERY_TO:?Set RECOVERY_TO to an ISO 8601 timestamp}"
+        exec tg-search recovery export \
+          --profile "$${RECOVERY_PROFILE}" \
+          --chat-file /recovery/chat-ids.txt \
+          --from "$${RECOVERY_FROM}" \
+          --to "$${RECOVERY_TO}" \
+          --output "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
+          --takeout
+
+  recovery-import-sqlite:
+    profiles: [recovery]
+    build: *recovery-build
+    environment:
+      EFB_DATA_PATH: /var/lib/efb
+      RECOVERY_PROFILE: ${RECOVERY_PROFILE:-recovery}
+      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
+      RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
+    volumes:
+      - *chat-file
+      - <<: *artifact-directory
+        read_only: true
+      - *etm-config
+      - type: bind
+        source: ${RECOVERY_ETM_SQLITE_DB_FILE:-../recovery/tgdata.db}
+        target: /var/lib/efb/profiles/${RECOVERY_PROFILE:-recovery}/blueset.telegram/tgdata.db
+        read_only: false
+        bind:
+          create_host_path: false
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        exec etm-msglog-import \
+          --profile "$${RECOVERY_PROFILE}" \
+          --artifact "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
+          --chat-file /recovery/chat-ids.txt \
+          --chunk-size "$${RECOVERY_CHUNK_SIZE}"
+
+  recovery-import-postgresql:
+    profiles: [recovery]
+    build: *recovery-build
+    environment:
+      EFB_DATA_PATH: /var/lib/efb
+      RECOVERY_PROFILE: ${RECOVERY_PROFILE:-recovery}
+      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
+      RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
+    volumes:
+      - *chat-file
+      - <<: *artifact-directory
+        read_only: true
+      - *etm-config
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        exec etm-msglog-import \
+          --profile "$${RECOVERY_PROFILE}" \
+          --artifact "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
+          --chat-file /recovery/chat-ids.txt \
+          --chunk-size "$${RECOVERY_CHUNK_SIZE}"
+
+volumes:
+  recovery_owner_data:
