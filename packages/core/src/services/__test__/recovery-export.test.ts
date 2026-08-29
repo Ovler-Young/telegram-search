@@ -114,7 +114,10 @@ describe('recovery artifact', () => {
     ])
     const context = {
       emitter: new EventEmitter(),
-      getClient: () => ({ getEntity: vi.fn(async (peer: Api.InputPeerChat) => entities.get(peer.chatId.toString())!) }),
+      getClient: () => ({
+        getEntity: vi.fn(async (peer: Api.InputPeerChat) => entities.get(peer.chatId.toString())!),
+        getMe: vi.fn(async () => ({ id: bigInt('9007199254740993123'), firstName: 'Owner' })),
+      }),
       getMyUser: () => ({ id: '777', username: 'owner', name: 'Owner Account' }),
     } as unknown as CoreContext
     const service = createRecoveryExportService({
@@ -176,7 +179,15 @@ describe('recovery artifact', () => {
     })
     const context = {
       emitter: new EventEmitter(),
-      getClient: () => ({ getEntity: vi.fn(async () => channel) }),
+      getClient: () => ({
+        getEntity: vi.fn(async () => channel),
+        getMe: vi.fn(async () => ({
+          id: bigInt('9007199254740993123'),
+          firstName: 'Owner',
+          lastName: 'Account',
+          username: undefined,
+        })),
+      }),
       getMyUser: () => ({ id: '777', username: 'owner', name: 'Owner Account' }),
     } as unknown as CoreContext
     const entityService = {
@@ -206,7 +217,12 @@ describe('recovery artifact', () => {
     expect(records[0]).toMatchObject({
       type: 'manifest',
       version: 1,
-      owner: { profile: 'owner-profile', telegramUserId: '777' },
+      owner: {
+        profile: 'owner-profile',
+        telegramUserId: '9007199254740993123',
+        username: null,
+        name: 'Owner Account',
+      },
       window: { semantics: '[from,to)' },
       chats: [{ topicChatId, sourceChatId }],
     })

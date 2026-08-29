@@ -16,6 +16,32 @@ export const recoveryExportInputSchema = object({
 
 export type RecoveryExportInput = InferOutput<typeof recoveryExportInputSchema>
 
+export interface RecoveryArtifactOwnerV1 {
+  profile: string
+  telegramUserId: string
+  username: string | null
+  name: string
+}
+
+export interface RecoveryArtifactChatV1 {
+  topicChatId: string
+  sourceChatId: string
+  title: string
+  type: 'supergroup' | 'group'
+}
+
+export interface RecoveryArtifactManifestV1 {
+  type: 'manifest'
+  version: 1
+  owner: RecoveryArtifactOwnerV1
+  window: {
+    from: string
+    to: string
+    semantics: '[from,to)'
+  }
+  chats: RecoveryArtifactChatV1[]
+}
+
 export type RecoveryExportUpdate
   = | { type: 'started', taskId: string }
     | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, exported: number }

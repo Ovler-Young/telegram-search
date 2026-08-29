@@ -1,5 +1,5 @@
 import type { Logger } from '@guiiai/logg'
-import type { RecoveryExportInput, RecoveryExportUpdate } from '@tg-search/protocol'
+import type { RecoveryArtifactManifestV1, RecoveryExportInput, RecoveryExportUpdate } from '@tg-search/protocol'
 
 import type { CoreContext } from '../context'
 import type { EntityService } from './entity'
@@ -147,20 +147,20 @@ export function createRecoveryExportService(options: {
       inputPeers.set(topicChatId, peer)
       return context.getClient().getEntity(peer)
     })
-    const owner = context.getMyUser()
+    const owner = await context.getClient().getMe()
     const temporaryPath = `${input.outputFile}.${taskId}.tmp`
     let exported = 0
 
     try {
       await mkdir(dirname(input.outputFile), { recursive: true })
-      const manifest = {
+      const manifest: RecoveryArtifactManifestV1 = {
         type: 'manifest',
         version: 1,
         owner: {
           profile: input.profile,
-          telegramUserId: owner.id,
-          username: owner.username,
-          name: owner.name,
+          telegramUserId: owner.id.toString(),
+          username: owner.username ?? null,
+          name: [owner.firstName, owner.lastName].filter(Boolean).join(' ').trim(),
         },
         window: {
           from: new Date(input.fromMs).toISOString(),
