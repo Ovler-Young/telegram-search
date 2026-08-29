@@ -331,9 +331,11 @@ describe('takeout service', () => {
     expect(((finished as Api.InvokeWithTakeout).query as Api.account.FinishTakeoutSession).success).toBe(false)
   })
 
-  it('takeoutMessages should accept millisecond startTime and filter correctly', async () => {
+  it('takeoutMessages should apply millisecond time bounds to requests and yielded messages', async () => {
     const startSec = 1_577_836_800 // 2020-01-01T00:00:00Z
     const startMs = startSec * 1000
+    const endMs = (startSec + 50) * 1000
+    const historyQueries: Api.messages.GetHistory[] = []
 
     const client = {
       getInputEntity: vi.fn(async (_chatId: string) => ({})),
@@ -351,6 +353,7 @@ describe('takeout service', () => {
           if (rangeWrapper instanceof Api.InvokeWithMessagesRange) {
             const inner = rangeWrapper.query
             if (inner instanceof Api.messages.GetHistory) {
+              historyQueries.push(inner)
               if ((inner).offsetId === 0) {
                 return {
                   messages: [
@@ -386,6 +389,7 @@ describe('takeout service', () => {
       minId: 0,
       maxId: 0,
       startTime: startMs,
+      endTime: endMs,
       skipMedia: true,
       task,
       expectedCount: 3,
@@ -396,7 +400,8 @@ describe('takeout service', () => {
       yielded.push(m)
     }
 
-    expect(yielded.map(m => m.id)).toEqual([30, 29])
+    expect(yielded.map(m => m.id)).toEqual([29])
+    expect(historyQueries[0]?.offsetDate).toBe(startSec + 51)
     expect(task.updateError).not.toHaveBeenCalled()
   })
 

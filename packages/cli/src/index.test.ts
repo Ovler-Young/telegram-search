@@ -6,7 +6,15 @@ import { join, resolve } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { emitResult, emitStreamResult, normalizeRawArgs, resolveExportOutputPath, runCli } from './index'
+import {
+  emitResult,
+  emitStreamResult,
+  normalizeRawArgs,
+  parseRecoveryChatFile,
+  parseRecoveryTimestamp,
+  resolveExportOutputPath,
+  runCli,
+} from './index'
 import { readProfileConfig, resolveProfilePaths } from './profile'
 
 const temporaryDirectories: string[] = []
@@ -30,6 +38,26 @@ function captureOutput() {
 }
 
 describe('cLI command boundary', () => {
+  it('parses a mounted chat file in deterministic first-seen order', () => {
+    expect(parseRecoveryChatFile(`
+      # ETM groups
+      -10012345678901234567890
+      -42 # basic group
+      -10012345678901234567890
+      -00042
+    `)).toEqual(['-10012345678901234567890', '-42'])
+
+    expect(() => parseRecoveryChatFile('group-one')).toThrow('line 1')
+    expect(() => parseRecoveryChatFile('# none')).toThrow('does not contain')
+  })
+
+  it('requires unambiguous timezone-aware recovery boundaries', () => {
+    expect(parseRecoveryTimestamp('2026-01-01T00:00:00+08:00', '--from'))
+      .toBe(Date.parse('2025-12-31T16:00:00Z'))
+    expect(() => parseRecoveryTimestamp('2026-01-01T00:00:00', '--from')).toThrow('explicit timezone')
+    expect(() => parseRecoveryTimestamp('2026-02-30T00:00:00Z', '--to')).toThrow('Invalid timestamp')
+  })
+
   it('resolves explicit export paths in the invoking process', () => {
     expect(resolveExportOutputPath('./telegram-2026', '/profile/exports')).toBe(
       resolve(process.cwd(), 'telegram-2026'),

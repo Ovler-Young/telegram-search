@@ -22,6 +22,7 @@ import {
   chatContracts,
   exportContracts,
   messageContracts,
+  recoveryContracts,
   statsContracts,
   syncContracts,
 } from '@tg-search/protocol'
@@ -146,6 +147,7 @@ export async function createCliRuntime(paths: ProfilePaths, options: { remote: b
     streams: {
       sync: defineStreamInvoke(eventContext, syncContracts.run),
       export: defineStreamInvoke(eventContext, exportContracts.run),
+      recoveryExport: defineStreamInvoke(eventContext, recoveryContracts.export),
     },
     close: async () => {
       unregister()

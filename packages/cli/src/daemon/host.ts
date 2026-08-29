@@ -103,6 +103,7 @@ export function createDaemonApplicationProxy(getApplication: () => TelegramAppli
     getLocalMessageContext: input => getApplication().getLocalMessageContext(input),
     getLocalStats: input => getApplication().getLocalStats(input),
     exportLocal: (input, signal) => getApplication().exportLocal!(input, signal),
+    exportRecovery: (input, signal) => getApplication().exportRecovery!(input, signal),
     sync: (input, signal) => getApplication().sync(input, signal),
   }
 }
