@@ -37,6 +37,41 @@ RUN pnpm run server:build
 RUN pnpm run web:build
 
 # ---------------------------------
+# -------- Recovery Runtime -------
+# ---------------------------------
+FROM node:24.13.0-bookworm-slim AS recovery
+
+ARG ETM_IMPORTER_REF=db843a01ebc4bb399277c4614c39a6ee159c89e4
+
+WORKDIR /app
+
+RUN corepack enable pnpm && \
+    corepack prepare pnpm@10.22.0 --activate && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git libmagic1 python3 python3-venv && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3 -m venv /opt/etm
+
+ENV PATH="/opt/etm/bin:${PATH}"
+
+RUN pip install --no-cache-dir \
+    "efb-telegram-master[postgresql] @ git+https://github.com/Ovler-Young/efb-telegram-master.git@${ETM_IMPORTER_REF}"
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/common/package.json ./packages/common/package.json
+COPY packages/core/package.json ./packages/core/package.json
+COPY packages/cli/package.json ./packages/cli/package.json
+COPY packages/observability/package.json ./packages/observability/package.json
+COPY packages/protocol/package.json ./packages/protocol/package.json
+COPY packages/schema/package.json ./packages/schema/package.json
+
+RUN CI=true pnpm install --frozen-lockfile --ignore-scripts --prod --filter @tg-search/cli...
+
+COPY --from=builder /app/packages/cli/dist ./packages/cli/dist
+RUN chmod +x ./packages/cli/dist/index.mjs && \
+    ln -s /app/packages/cli/dist/index.mjs /usr/local/bin/tg-search
+
+# ---------------------------------
 # --------- Runtime Stage ---------
 # ---------------------------------
 FROM node:24.13.0-alpine
