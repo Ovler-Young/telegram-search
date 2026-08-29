@@ -42,6 +42,7 @@ RUN pnpm run web:build
 FROM node:24.13.0-bookworm-slim AS recovery
 
 ARG ETM_IMPORTER_REF=db843a01ebc4bb399277c4614c39a6ee159c89e4
+ARG ETM_PROFILE=recovery
 
 WORKDIR /app
 
@@ -50,7 +51,8 @@ RUN corepack enable pnpm && \
     apt-get update && \
     apt-get install -y --no-install-recommends git libmagic1 python3 python3-venv && \
     rm -rf /var/lib/apt/lists/* && \
-    python3 -m venv /opt/etm
+    python3 -m venv /opt/etm && \
+    mkdir -p "/var/lib/efb/profiles/${ETM_PROFILE}/blueset.telegram"
 
 ENV PATH="/opt/etm/bin:${PATH}"
 

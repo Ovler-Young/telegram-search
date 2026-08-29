@@ -6,6 +6,7 @@ x-recovery-build: &recovery-build
   target: recovery
   args:
     ETM_IMPORTER_REF: ${ETM_IMPORTER_REF:-db843a01ebc4bb399277c4614c39a6ee159c89e4}
+    ETM_PROFILE: ${RECOVERY_PROFILE:-recovery}
 
 x-owner-environment: &owner-environment
   TG_SEARCH_HOME: /var/lib/tg-search
