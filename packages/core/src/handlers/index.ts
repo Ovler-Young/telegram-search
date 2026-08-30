@@ -22,10 +22,10 @@ export function registerApplicationHandlers(context: EventContext<any, any>, app
       exportLocal: application.exportLocal,
     })
   }
-  if (application.auditRecovery) {
+  if (application.repairRecovery) {
     registerRecoveryHandler(context, {
       ...application,
-      auditRecovery: application.auditRecovery,
+      repairRecovery: application.repairRecovery,
     })
   }
   return () => {

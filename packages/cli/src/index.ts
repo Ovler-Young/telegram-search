@@ -43,6 +43,12 @@ function stringArg(value: string | boolean | string[] | undefined): string {
   return ''
 }
 
+function stringArgs(value: string | boolean | string[] | undefined): string[] {
+  if (typeof value === 'string')
+    return [value]
+  return Array.isArray(value) ? value : []
+}
+
 function parseTimestamp(value: string | undefined): number | undefined {
   if (!value)
     return undefined
@@ -99,7 +105,7 @@ export function parseRecoveryTimestamp(value: string, option: '--from' | '--to')
 
 export function parseRecoveryEtmSource(sqlitePath: string, postgresUrl: string) {
   if (Boolean(sqlitePath) === Boolean(postgresUrl))
-    throw new Error('Recovery audit requires exactly one of --etm-sqlite or --etm-postgres-url')
+    throw new Error('Recovery repair requires exactly one of --etm-sqlite or --etm-postgres-url')
   return sqlitePath
     ? { backend: 'sqlite' as const, path: resolve(sqlitePath) }
     : { backend: 'postgres' as const, url: postgresUrl }
@@ -546,16 +552,19 @@ const exportCommand = defineCommand({
 })
 
 const recoveryCommand = defineCommand({
-  meta: { name: 'recovery', description: 'Audit bounded owner-account history against ETM MsgLog' },
+  meta: { name: 'recovery', description: 'Repair bounded ETM MsgLog gaps from owner-account history' },
   subCommands: {
-    audit: defineCommand({
-      meta: { name: 'audit', description: 'Write a read-only diagnostic comparison against ETM' },
+    repair: defineCommand({
+      meta: { name: 'repair', description: 'Insert verified bot history missing from ETM MsgLog' },
       args: {
         'etm-sqlite': { type: 'string' },
         'etm-postgres-url': { type: 'string' },
         'from': { type: 'string', required: true },
         'to': { type: 'string', required: true },
-        'output': { type: 'string', required: true },
+        'main-bot-username': { type: 'string', required: true },
+        'aux-bot-username': { type: 'string' },
+        'chunk-size': { type: 'string', default: '250' },
+        'output': { type: 'string' },
         'takeout': { type: 'boolean', default: false },
         ...profileArg,
       },
@@ -564,16 +573,22 @@ const recoveryCommand = defineCommand({
         const fromMs = parseRecoveryTimestamp(stringArg(context.args.from), '--from')
         const toMs = parseRecoveryTimestamp(stringArg(context.args.to), '--to')
         if (fromMs >= toMs)
-          throw new Error('Recovery audit requires --from to be earlier than --to')
+          throw new Error('Recovery repair requires --from to be earlier than --to')
         const sqlitePath = stringArg(context.args['etm-sqlite'])
         const postgresUrl = stringArg(context.args['etm-postgres-url'])
-        const outputFile = resolve(stringArg(context.args.output))
+        const chunkSize = Number(stringArg(context.args['chunk-size']))
+        if (!Number.isInteger(chunkSize) || chunkSize <= 0)
+          throw new Error('Recovery repair requires --chunk-size to be a positive integer')
+        const output = stringArg(context.args.output)
         await withRuntime(profile, true, async (runtime) => {
-          await emitStreamResult(runtime.streams.recoveryAudit({
+          await emitStreamResult(runtime.streams.recoveryRepair({
             etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
             fromMs,
             toMs,
-            outputFile,
+            mainBotUsername: stringArg(context.args['main-bot-username']),
+            auxiliaryBotUsernames: stringArgs(context.args['aux-bot-username']),
+            chunkSize,
+            outputFile: output ? resolve(output) : null,
             takeout: context.args.takeout === true,
           }), outputMeta(profile, 'telegram'))
         })

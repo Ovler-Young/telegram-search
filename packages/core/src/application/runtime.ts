@@ -12,8 +12,8 @@ import type {
   MessageContextInput,
   MessageRecord,
   QueryLocalMessagesInput,
-  RecoveryAuditInput,
-  RecoveryAuditUpdate,
+  RecoveryRepairInput,
+  RecoveryRepairUpdate,
   SearchMessageRecord,
   SearchMessagesInput,
   StatsInput,
@@ -60,7 +60,7 @@ export interface TelegramApplication {
   getLocalMessageContext: (input: MessageContextInput) => Promise<AppResult<MessageContext>>
   getLocalStats: (input: StatsInput) => Promise<AppResult<StatsResult>>
   exportLocal?: (input: ExportInput, signal?: AbortSignal) => AsyncGenerator<ExportUpdate>
-  auditRecovery?: (input: RecoveryAuditInput, signal?: AbortSignal) => AsyncGenerator<RecoveryAuditUpdate>
+  repairRecovery?: (input: RecoveryRepairInput, signal?: AbortSignal) => AsyncGenerator<RecoveryRepairUpdate>
   sync: (input: SyncInput, signal?: AbortSignal) => AsyncGenerator<SyncUpdate>
 }
 
@@ -311,9 +311,9 @@ export function createTelegramApplicationRuntime(options: {
     }))(input, signal)
   }
 
-  async function* auditRecovery(input: RecoveryAuditInput, signal?: AbortSignal): AsyncGenerator<RecoveryAuditUpdate> {
-    const { createRecoveryAuditService } = await import('../services/recovery-audit')
-    yield* createRecoveryAuditService({ context, logger, entityService, takeoutService })(input, signal)
+  async function* repairRecovery(input: RecoveryRepairInput, signal?: AbortSignal): AsyncGenerator<RecoveryRepairUpdate> {
+    const { createRecoveryRepairService } = await import('../services/recovery-repair')
+    yield* createRecoveryRepairService({ context, logger, entityService, takeoutService })(input, signal)
   }
 
   return {
@@ -332,7 +332,7 @@ export function createTelegramApplicationRuntime(options: {
     getLocalMessageContext: input => appResult(() => localMessages.context(input)),
     getLocalStats: input => appResult(() => calculateLocalStats(input)),
     exportLocal: isBrowser() ? undefined : exportLocal,
-    auditRecovery: isBrowser() ? undefined : auditRecovery,
+    repairRecovery: isBrowser() ? undefined : repairRecovery,
     sync,
     dispose: async () => {},
   }
