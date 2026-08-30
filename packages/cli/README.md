@@ -84,7 +84,7 @@ tg-search --profile work messages list --chat 123456 --sender me --to 2026-01-31
 
 ## Docker recovery workflow
 
-The recovery Compose profile provides explicit, run-once jobs for owner-account authentication and best-effort repair of ETM `MsgLog` gaps. ETM's existing `TopicAssoc` rows select the Telegram groups and topics to inspect. The repair scans owner-account history in the built-in interval `[2026-07-13T18:22:03Z, command-start-time)`, checks both `master_msg_id` and `master_msg_id_alt`, and inserts missing synthetic rows directly into the selected ETM database.
+The recovery Compose profile provides explicit, run-once jobs for owner-account authentication and best-effort repair of ETM `MsgLog` gaps. ETM's existing `TopicAssoc` rows select the Telegram groups and topics to inspect. The repair scans owner-account history in the built-in interval `[2026-07-13T18:22:03Z, command-start-time)`, checks both `master_msg_id` and `master_msg_id_alt`, and inserts missing synthetic rows directly into the database selected by the ETM configuration.
 
 Create a private report directory. `RECOVERY_REPORT_FILE` must be a filename within `RECOVERY_REPORT_DIR`.
 
@@ -96,6 +96,7 @@ export RECOVERY_PROFILE=recovery
 export RECOVERY_REPORT_DIR="$PWD/recovery-reports"
 export RECOVERY_REPORT_FILE=etm-repair.jsonl
 export RECOVERY_CHUNK_SIZE=250
+export RECOVERY_ETM_CONFIG_FILE='/absolute/path/to/etm-config.yaml'
 export TELEGRAM_API_ID='<telegram-api-id>'
 export TELEGRAM_API_HASH='<telegram-api-hash>'
 ```
@@ -109,17 +110,16 @@ docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm
 
 The authentication service runs `tg-search --profile recovery auth login` when `RECOVERY_PROFILE=recovery`.
 
-For SQLite, provide the existing ETM database file. Compose mounts it read-write at `/etm/tgdata.db`, and mounts the report directory read-write.
+For SQLite, the ETM configuration must select SQLite. Provide the existing ETM database file separately. Compose mounts the configuration read-only at `/run/etm/config.yaml`, the database read-write at `/etm/tgdata.db`, and the report directory read-write.
 
 ```bash
 export RECOVERY_ETM_SQLITE_DB_FILE='/absolute/path/to/tgdata.db'
 docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-repair-sqlite
 ```
 
-For PostgreSQL, supply the DSN only in the runtime environment. The job mounts no ETM config or database file.
+For PostgreSQL, the mounted ETM configuration must set `database.type: postgresql`. The job mounts no database file; all connection settings, including the password, come from the read-only configuration mount.
 
 ```bash
-export RECOVERY_ETM_POSTGRES_URL='postgresql://user:password@host:5432/database'
 docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-repair-postgresql
 ```
 
@@ -128,27 +128,30 @@ Both repair jobs run the following bounded command with the selected database op
 ```bash
 tg-search recovery repair \
   --profile recovery \
+  --etm-config /run/etm/config.yaml \
   --etm-sqlite /etm/tgdata.db \
   --chunk-size 250 \
   --output /reports/etm-repair.jsonl \
   --takeout
 ```
 
-The PostgreSQL job uses the same bounds and output path, replacing `--etm-sqlite /etm/tgdata.db` with `--etm-postgres-url "$RECOVERY_ETM_POSTGRES_URL"`.
+The PostgreSQL job uses the same command without `--etm-sqlite`; the mounted configuration is its only database source. The CLI rejects a PostgreSQL configuration when `--etm-sqlite` is supplied and rejects a SQLite configuration when it is absent.
 
 `--takeout` requires owner approval. If Telegram requests a separate Takeout confirmation, approve it in Telegram and rerun the repair job; the job does not retry automatically.
 
-Sender roles are derived from ETM database state after the bounded archive acquisition. A non-null `MsgLog.sender_bot_id` identifies an auxiliary bot. Existing rows with null `sender_bot_id` are joined to archived messages through either master-ID column to identify main bots. Every evidenced sender must resolve through the owner account to a Telegram bot user before any write occurs, and contradictory role or archive evidence aborts the repair. Multiple historically evidenced main bot IDs are supported. A verified bot found only in missing archive rows has no trustworthy role and is skipped as `unclassified-verified-bot`; human or unverified senders are counted separately.
+The repair reads the main identity from `token` and auxiliary identities from each `auxiliary_bots[].token`. It extracts only the numeric bot ID before the colon and never includes a token in stdout or the report. Each configured identity must resolve through the owner account to the matching Telegram bot user before any database inspection or write occurs. Messages from humans, unconfigured senders, or identities that cannot be verified are counted as `human-or-unconfigured-sender` and are not inserted.
 
-Each inserted row uses `<ETM Bot API chat ID>.<Telegram message ID>` as `master_msg_id`, the `TopicAssoc.slave_uid` for the matched topic, `Text` message/media types, and `mtproto-backfill:<master_msg_id>` as its synthetic `slave_message_id`. A message from an evidenced main bot stores SQL `NULL` in `sender_bot_id`; a message from an evidenced auxiliary bot stores that bot's numeric Telegram user ID. Messages outside a bound topic, empty text, and unusable service/deleted messages are not inserted.
+The configuration also supplies `database.type`, `database`, `host`, `port`, `user`, `password`, `max_connections`, `stale_timeout`, and `options`. Unless `database.type` is exactly `postgresql`, the repair selects SQLite and requires the separately mounted database file. PostgreSQL uses ETM's defaults when fields are omitted: database `efb_telegram`, host `localhost`, port `5432`, user `postgres`, an empty password, `max_connections: 8`, `stale_timeout: 300`, and `options: -c timezone=UTC`. `max_connections` controls the connection pool and `options` is passed to PostgreSQL. `stale_timeout` is validated for compatibility with the ETM configuration but has no node-postgres mapping. SSL/TLS configuration fields are unsupported and make the command fail before database access.
 
-The first JSONL row is a `repair-summary`; it records the effective `[from,to)` window and the inferred main and auxiliary IDs. Later `repair-message` rows identify candidates without copying message text. Candidate status is `present-primary`, `present-alt`, or `repair-attempted`. Use the summary counts for outcomes: `inserted` records committed rows; `present-primary` and `present-alt` were represented at the pre-write snapshot; `concurrent` appeared before the serialized insert; `conflicts` lost an insert conflict; and `errors` counts candidates in failed chunks. `unbound-topic`, `human-or-unverified-sender`, `unclassified-verified-bot`, and `service-deleted-unusable` explain filtered history.
+Each inserted row uses `<ETM Bot API chat ID>.<Telegram message ID>` as `master_msg_id`, the `TopicAssoc.slave_uid` for the matched topic, `Text` message/media types, and `mtproto-backfill:<master_msg_id>` as its synthetic `slave_message_id`. A message from the configured main bot stores SQL `NULL` in `sender_bot_id`; a message from a configured auxiliary bot stores that bot's numeric Telegram user ID. Messages outside a bound topic, empty text, and unusable service/deleted messages are not inserted.
+
+The first JSONL row is a `repair-summary`; it records the effective `[from,to)` window and the configured numeric main and auxiliary IDs. Later `repair-message` rows identify candidates without copying message text. Candidate status is `present-primary`, `present-alt`, or `repair-attempted`. Use the summary counts for outcomes: `inserted` records committed rows; `present-primary` and `present-alt` were represented at the pre-write snapshot; `concurrent` appeared before the serialized insert; `conflicts` lost an insert conflict; and `errors` counts candidates in failed chunks. `unbound-topic`, `human-or-unconfigured-sender`, and `service-deleted-unusable` explain filtered history.
 
 Reruns are idempotent for rows already represented by either ETM master-ID column. SQLite uses short `BEGIN IMMEDIATE` chunks, while PostgreSQL uses short transactions with a table lock and `ON CONFLICT DO NOTHING`; concurrent ETM delivery is rechecked or recorded as a conflict instead of being overwritten. A failed chunk is counted in `errors` and later chunks continue.
 
 Accepted limitation: the inserted `slave_message_id` and related slave fields are synthetic because Telegram history does not retain ETM's original slave-side identity or serialized message state. On an unchanged ETM installation, historical edit, quote, remove, and react operations cannot reliably target these repaired rows. The repair restores searchable `MsgLog` text and routing metadata on a best-effort basis; it does not reconstruct authoritative historical operation targets.
 
-Keep the Telegram API hash, PostgreSQL DSN, owner session volume, report, and SQLite database private. Compose passes credentials and the DSN only in the runtime environment; its commands do not echo them, and the image contains none of these values. No ETM Python package, ETM configuration, or ETM credential file is mounted. Restrict host files and the report directory to the account performing the repair. Each service exits after its command; the Compose profile defines no restart policy or scheduler.
+Keep the Telegram API hash, ETM configuration, owner session volume, report, and SQLite database private. The ETM configuration and SQLite database must already exist on the host; Compose does not create missing host paths. The configuration is never copied into the image or exposed as container environment content, and commands do not echo its tokens or password. Telegram API credentials remain runtime environment values. Restrict host files and the report directory to the account performing the repair. Each service exits after its command; the Compose profile defines no restart policy or scheduler.
 
 ## Annual export
 
