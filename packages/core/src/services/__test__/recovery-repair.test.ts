@@ -12,6 +12,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import bigInt from 'big-integer'
 
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { EventEmitter } from 'eventemitter3'
 import { Client } from 'pg'
 import { Api } from 'telegram'
@@ -19,13 +20,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createRecoveryRepairService,
+  inferSenderRoles,
   insertRepairCandidates,
   inspectEtm,
   normalizeBindings,
-  normalizeBotUsernames,
+  normalizeSenderEvidence,
   parseEtmGroupId,
   readInitialPresences,
-  resolveVerifiedBots,
 } from '../recovery-repair'
 
 const temporaryDirectories: string[] = []
@@ -67,12 +68,12 @@ function createEtmDatabase(path: string) {
   return database
 }
 
-function insertExisting(database: DatabaseSync, primary: string, alternate: string | null) {
+function insertExisting(database: DatabaseSync, primary: string, alternate: string | null, senderBotId: string | null = null) {
   database.prepare(`INSERT INTO msglog (
     master_msg_id, master_msg_id_alt, slave_message_id, text, slave_origin_uid,
-    slave_member_uid, media_type, msg_type, sent_to, time
-  ) VALUES (?, ?, 'live', 'live', 'slave.module chat', 'slave.module member', 'Text', 'Text', 'blueset.telegram', '2026-01-01')`)
-    .run(primary, alternate)
+    slave_member_uid, media_type, msg_type, sent_to, sender_bot_id, time
+  ) VALUES (?, ?, 'live', 'live', 'slave.module chat', 'slave.module member', 'Text', 'Text', 'blueset.telegram', ?, '2026-01-01')`)
+    .run(primary, alternate, senderBotId)
 }
 
 afterEach(async () => {
@@ -96,20 +97,26 @@ describe('eTM discovery and bot identity', () => {
     ])).toThrow('Unusable')
   })
 
-  it('validates, normalizes, deduplicates, and resolves main and auxiliary bot usernames', async () => {
-    expect(normalizeBotUsernames('@Main_Bot', ['AUX_BOT'])).toEqual({ main: 'main_bot', auxiliary: ['aux_bot'] })
-    expect(() => normalizeBotUsernames('main_bot', ['@MAIN_BOT'])).toThrow('Duplicate')
-    expect(() => normalizeBotUsernames('', [])).toThrow('Invalid')
-
-    const entities = new Map([
-      ['@main_bot', new Api.User({ id: bigInt(9), firstName: 'Main', username: 'Main_Bot', bot: true })],
-      ['@aux_bot', new Api.User({ id: bigInt(10), firstName: 'Aux', username: 'aux_bot', bot: true })],
+  it('infers main and auxiliary roles through primary and alternate MsgLog identities', () => {
+    const messages = new Map([
+      ['-1000000000042.11', { topicChatId: '-1000000000042', sourceChatId: '42', messageId: '11', senderId: '9', timestamp: 1, text: 'main' }],
+      ['-1000000000042.12', { topicChatId: '-1000000000042', sourceChatId: '42', messageId: '12', senderId: '10', timestamp: 1, text: 'aux' }],
     ])
-    const bots = await resolveVerifiedBots({ getEntity: vi.fn(async value => entities.get(String(value))!) }, '@Main_Bot', ['Aux_Bot'])
-    expect(bots).toEqual([
-      { id: '9', username: 'main_bot', senderBotId: null },
-      { id: '10', username: 'aux_bot', senderBotId: '10' },
+    const evidence = normalizeSenderEvidence([
+      { master_msg_id: '-1000000000042.11', master_msg_id_alt: null, sender_bot_id: null },
+      { master_msg_id: 'legacy', master_msg_id_alt: '-1000000000042.12', sender_bot_id: '10' },
     ])
+    expect(inferSenderRoles(evidence, messages, ['-1000000000042'])).toEqual(new Map([['9', null], ['10', '10']]))
+    expect(() => inferSenderRoles([
+      ...evidence,
+      { primaryIdentity: '-1000000000042.11', alternateIdentity: null, senderBotId: '9' },
+    ], messages, ['-1000000000042'])).toThrow('Contradictory')
+    expect(() => inferSenderRoles([
+      { primaryIdentity: '-1000000000042.11', alternateIdentity: null, senderBotId: '10' },
+    ], messages, ['-1000000000042'])).toThrow('contradicts archive sender')
+    expect(() => inferSenderRoles([
+      { primaryIdentity: '-1000000000042.11', alternateIdentity: '-1000000000042.12', senderBotId: null },
+    ], messages, ['-1000000000042'])).toThrow('identities contradict archive sender')
   })
 
   it('validates a real SQLite schema and checks both MsgLog identity columns', async () => {
@@ -123,6 +130,7 @@ describe('eTM discovery and bot identity', () => {
 
     await expect(inspectEtm({ backend: 'sqlite', path })).resolves.toEqual({
       bindings: [{ topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' }],
+      senderEvidence: [{ primaryIdentity: '-1000000000042.11', alternateIdentity: '-1000000000042.12', senderBotId: null }],
     })
     await expect(readInitialPresences({ backend: 'sqlite', path }, [
       '-1000000000042.11',
@@ -143,7 +151,30 @@ describe('eTM discovery and bot identity', () => {
 })
 
 describe('bounded recovery repair', () => {
+  it('uses the fixed incident cutoff and rejects a clock at that boundary', async () => {
+    expect(RECOVERY_REPAIR_FROM_ISO).toBe('2026-07-13T18:22:03Z')
+    const inspect = vi.fn()
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: vi.fn() } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn() },
+      takeoutService: { takeoutMessages: vi.fn() },
+      inspect,
+    })
+    const iterator = service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO),
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    })
+    await expect(iterator.next()).rejects.toThrow(RECOVERY_REPAIR_FROM_ISO)
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
   it('inserts mapped main and auxiliary bot text, filters other records, and reruns idempotently', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const toMs = (fromSeconds + 200) * 1000
     const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
     temporaryDirectories.push(directory)
     const path = join(directory, 'etm.db')
@@ -152,10 +183,13 @@ describe('bounded recovery repair', () => {
     database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(1, '-1000000000042', '10', 'slave.module chat-a')
     insertExisting(database, '-1000000000042.100', null)
     insertExisting(database, '-1000000000042.199', '-1000000000042.101')
+    insertExisting(database, 'legacy.aux', null, '10')
     database.close()
 
     const main = new Api.User({ id: bigInt(9), firstName: 'Main', username: 'main_bot', bot: true })
     const auxiliary = new Api.User({ id: bigInt(10), firstName: 'Aux', username: 'aux_bot', bot: true })
+    const unknownBot = new Api.User({ id: bigInt(12), firstName: 'Unknown', username: 'unknown_bot', bot: true })
+    const human = new Api.User({ id: bigInt(11), firstName: 'Human', bot: false })
     const group = new Api.Channel({
       id: bigInt(42),
       accessHash: bigInt(1),
@@ -165,14 +199,17 @@ describe('bounded recovery repair', () => {
       megagroup: true,
     })
     const client = {
-      getEntity: vi.fn(async (peer: unknown) => peer === '@main_bot' ? main : peer === '@aux_bot' ? auxiliary : group),
+      getEntity: vi.fn(async (peer: unknown) => {
+        const id = peer instanceof Api.PeerUser ? peer.userId.toString() : undefined
+        return id === '9' ? main : id === '10' ? auxiliary : id === '12' ? unknownBot : id === '11' ? human : group
+      }),
     }
     const context = { emitter: new EventEmitter(), getClient: () => client } as unknown as CoreContext
     const message = (id: number, sender: number, text: string, top?: number, reply?: number) => new Api.Message({
       id,
       peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
       fromId: new Api.PeerUser({ userId: bigInt(sender) }),
-      date: id,
+      date: id === 99 ? fromSeconds - 1 : fromSeconds + id,
       message: text,
       replyTo: top || reply ? new Api.MessageReplyHeader({ replyToMsgId: reply ?? top!, replyToTopId: top }) : undefined,
     })
@@ -183,13 +220,14 @@ describe('bounded recovery repair', () => {
       message(102, 9, 'main text', 10),
       message(103, 10, 'aux text', undefined, 10),
       message(104, 11, 'human text', 10),
+      message(107, 12, 'unknown bot text', 10),
       message(105, 9, 'wrong topic', 99),
       message(106, 9, '', 10),
       message(200, 9, 'outside', 10),
     ]
     const takeoutMessages = vi.fn(async function* (_chatId: string, options: Parameters<TakeoutService['takeoutMessages']>[1]) {
-      expect(options.startTime).toBe(100_000)
-      expect(options.endTime).toBe(199_999)
+      expect(options.startTime).toBe(Date.parse(RECOVERY_REPAIR_FROM_ISO))
+      expect(options.endTime).toBe(toMs - 1)
       yield* messages
     })
     const service = createRecoveryRepairService({
@@ -200,10 +238,7 @@ describe('bounded recovery repair', () => {
     })
     const input = {
       etm: { backend: 'sqlite' as const, path },
-      fromMs: 100_000,
-      toMs: 200_000,
-      mainBotUsername: 'main_bot',
-      auxiliaryBotUsernames: ['aux_bot'],
+      startedAtMs: toMs,
       chunkSize: 1,
       outputFile: output,
       takeout: true,
@@ -218,12 +253,18 @@ describe('bounded recovery repair', () => {
     expect(first).toMatchObject({
       type: 'completed',
       summary: {
+        window: {
+          from: RECOVERY_REPAIR_FROM_ISO,
+          to: new Date(toMs).toISOString(),
+          semantics: '[from,to)',
+        },
         counts: {
           'present-primary': 1,
           'present-alt': 1,
           'inserted': 2,
           'unbound-topic': 1,
           'human-or-unverified-sender': 1,
+          'unclassified-verified-bot': 1,
           'service-deleted-unusable': 1,
           'concurrent': 0,
           'conflicts': 0,
@@ -281,14 +322,13 @@ describe('bounded recovery repair', () => {
       slaveModule: 'slave.module',
     }]
     const inspect = vi.fn()
-      .mockResolvedValueOnce({ bindings })
-      .mockResolvedValueOnce({ bindings: [{ ...bindings[0], messageThreadId: '11' }] })
+      .mockResolvedValueOnce({ bindings, senderEvidence: [] })
+      .mockResolvedValueOnce({ bindings: [{ ...bindings[0], messageThreadId: '11' }], senderEvidence: [] })
     const insert = vi.fn()
-    const bot = new Api.User({ id: bigInt(9), firstName: 'Main', username: 'main_bot', bot: true })
     const group = new Api.Channel({ id: bigInt(42), accessHash: bigInt(1), title: 'Bound', photo: new Api.ChatPhotoEmpty(), date: 0, megagroup: true })
     const context = {
       emitter: new EventEmitter(),
-      getClient: () => ({ getEntity: vi.fn(async peer => peer === '@main_bot' ? bot : group) }),
+      getClient: () => ({ getEntity: vi.fn(async () => group) }),
     } as unknown as CoreContext
     const service = createRecoveryRepairService({
       context,
@@ -301,10 +341,7 @@ describe('bounded recovery repair', () => {
     const run = async () => {
       for await (const update of service({
         etm: { backend: 'sqlite', path: '/unused' },
-        fromMs: 100,
-        toMs: 200,
-        mainBotUsername: 'main_bot',
-        auxiliaryBotUsernames: [],
+        startedAtMs: Date.now(),
         chunkSize: 10,
         outputFile: null,
         takeout: true,
@@ -319,7 +356,7 @@ describe('bounded recovery repair', () => {
     const group = new Api.Channel({ id: bigInt(42), accessHash: bigInt(1), title: 'Bound', photo: new Api.ChatPhotoEmpty(), date: 0, megagroup: true })
     const context = {
       emitter: new EventEmitter(),
-      getClient: () => ({ getEntity: vi.fn(async peer => peer === '@main_bot' ? bot : group) }),
+      getClient: () => ({ getEntity: vi.fn(async peer => peer instanceof Api.PeerUser && peer.userId.toString() === '9' ? bot : group) }),
     } as unknown as CoreContext
     const binding = { topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' }
     const service = createRecoveryRepairService({
@@ -332,23 +369,23 @@ describe('bounded recovery repair', () => {
             id: 150,
             peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
             fromId: new Api.PeerUser({ userId: bigInt(9) }),
-            date: 150,
+            date: Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000 + 1,
             message: 'text',
             replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
           })
         },
       },
-      inspect: vi.fn(async () => ({ bindings: [binding] })),
+      inspect: vi.fn(async () => ({
+        bindings: [binding],
+        senderEvidence: [{ primaryIdentity: '-1000000000042.150', alternateIdentity: null, senderBotId: null }],
+      })),
       presences: vi.fn(async () => new Map()),
       insert: vi.fn(async () => ({ inserted: 0, concurrent: 1, conflicts: 0, errors: 0 })),
     })
     const updates = []
     for await (const update of service({
       etm: { backend: 'sqlite', path: '/unused' },
-      fromMs: 100_000,
-      toMs: 200_000,
-      mainBotUsername: 'main_bot',
-      auxiliaryBotUsernames: [],
+      startedAtMs: Date.now(),
       chunkSize: 10,
       outputFile: null,
       takeout: true,

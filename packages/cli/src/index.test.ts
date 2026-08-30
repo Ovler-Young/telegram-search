@@ -4,15 +4,14 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   emitResult,
   emitStreamResult,
   normalizeRawArgs,
-  normalizeRecoveryBotUsernames,
   parseRecoveryEtmSource,
-  parseRecoveryTimestamp,
   resolveExportOutputPath,
   runCli,
 } from './index'
@@ -39,20 +38,22 @@ function captureOutput() {
 }
 
 describe('cLI command boundary', () => {
-  it('normalizes and validates recovery bot usernames before opening the runtime', () => {
-    expect(normalizeRecoveryBotUsernames(' @Main_Bot ', ['AuxOneBot', '@aux_two_bot'])).toEqual({
-      main: 'main_bot',
-      auxiliary: ['auxonebot', 'aux_two_bot'],
-    })
-    expect(() => normalizeRecoveryBotUsernames('not-a-bot', [])).toThrow('Invalid Telegram bot username')
-    expect(() => normalizeRecoveryBotUsernames('MainBot', ['@mainbot'])).toThrow('Duplicate Telegram bot username')
+  it('does not accept caller-supplied recovery window or bot-role options', async () => {
+    for (const option of ['--from', '--to', '--main-bot-username', '--aux-bot-username']) {
+      const output = captureOutput()
+      await runCli(['recovery', 'repair', '--etm-sqlite', '/unused', option, 'value', '--takeout'])
+      expect(output.stdoutJson()).toMatchObject({ ok: false })
+      vi.restoreAllMocks()
+      process.exitCode = originalExitCode
+    }
   })
 
-  it('requires unambiguous timezone-aware recovery boundaries', () => {
-    expect(parseRecoveryTimestamp('2026-01-01T00:00:00+08:00', '--from'))
-      .toBe(Date.parse('2025-12-31T16:00:00Z'))
-    expect(() => parseRecoveryTimestamp('2026-01-01T00:00:00', '--from')).toThrow('explicit timezone')
-    expect(() => parseRecoveryTimestamp('2026-02-30T00:00:00Z', '--to')).toThrow('Invalid timestamp')
+  it('captures the recovery upper bound once before command validation', async () => {
+    const output = captureOutput()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(RECOVERY_REPAIR_FROM_ISO) + 1)
+    await runCli(['recovery', 'repair', '--etm-sqlite', '/unused', '--chunk-size', '0', '--takeout'])
+    expect(now).toHaveBeenCalledOnce()
+    expect(output.stdoutJson()).toMatchObject({ ok: false })
   })
 
   it('requires exactly one ETM database source', () => {

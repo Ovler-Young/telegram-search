@@ -16,6 +16,9 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import bigInt from 'big-integer'
+
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { Client } from 'pg'
 import { Api } from 'telegram'
 import { v4 as uuidv4 } from 'uuid'
@@ -53,11 +56,12 @@ export interface TopicBinding {
 
 export interface EtmInspection {
   bindings: TopicBinding[]
+  senderEvidence: SenderEvidence[]
 }
 
-export interface VerifiedBot {
-  id: string
-  username: string
+export interface SenderEvidence {
+  primaryIdentity: string
+  alternateIdentity: string | null
   senderBotId: string | null
 }
 
@@ -72,7 +76,7 @@ export interface RepairCandidate {
   binding: TopicBinding
 }
 
-interface AcquiredMessage {
+export interface AcquiredMessage {
   topicChatId: string
   sourceChatId: string
   messageId: string
@@ -162,6 +166,7 @@ function inspectSqlite(path: string): EtmInspection {
     assertColumns(msgLogColumns, MSGLOG_COLUMNS, 'msglog')
     return {
       bindings: normalizeBindings(database.prepare('SELECT topic_chat_id, message_thread_id, slave_uid FROM topicassoc').all() as Array<Record<string, unknown>>),
+      senderEvidence: normalizeSenderEvidence(database.prepare('SELECT master_msg_id, master_msg_id_alt, sender_bot_id FROM msglog').all() as Array<Record<string, unknown>>),
     }
   }
   finally {
@@ -181,8 +186,9 @@ async function inspectPostgres(url: string): Promise<EtmInspection> {
     assertColumns(columns.rows.filter(row => row.table_name === 'topicassoc').map(row => row.column_name), TOPIC_COLUMNS, 'topicassoc')
     assertColumns(columns.rows.filter(row => row.table_name === 'msglog').map(row => row.column_name), MSGLOG_COLUMNS, 'msglog')
     const rows = await client.query('SELECT topic_chat_id, message_thread_id, slave_uid FROM topicassoc')
+    const senderRows = await client.query('SELECT master_msg_id, master_msg_id_alt, sender_bot_id FROM msglog')
     await client.query('COMMIT')
-    return { bindings: normalizeBindings(rows.rows) }
+    return { bindings: normalizeBindings(rows.rows), senderEvidence: normalizeSenderEvidence(senderRows.rows) }
   }
   catch (error) {
     await client.query('ROLLBACK').catch(() => {})
@@ -203,45 +209,67 @@ function sameBindings(left: TopicBinding[], right: TopicBinding[]): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-const BOT_USERNAME = /^[a-z]\w{1,28}bot$/i
-
-export function normalizeBotUsernames(main: string, auxiliary: string[]): { main: string, auxiliary: string[] } {
-  const normalize = (value: string) => value.trim().replace(/^@/, '').toLowerCase()
-  const normalizedMain = normalize(main)
-  const normalizedAuxiliary = auxiliary.map(normalize)
-  for (const username of [normalizedMain, ...normalizedAuxiliary]) {
-    if (!BOT_USERNAME.test(username))
-      throw new Error(`Invalid Telegram bot username: ${username || '<empty>'}`)
-  }
-  const seen = new Set([normalizedMain])
-  for (const username of normalizedAuxiliary) {
-    if (seen.has(username))
-      throw new Error(`Duplicate Telegram bot username: ${username}`)
-    seen.add(username)
-  }
-  return { main: normalizedMain, auxiliary: normalizedAuxiliary }
+export function normalizeSenderEvidence(rows: Array<Record<string, unknown>>): SenderEvidence[] {
+  return rows.map(row => ({
+    primaryIdentity: String(row.master_msg_id),
+    alternateIdentity: row.master_msg_id_alt == null ? null : String(row.master_msg_id_alt),
+    senderBotId: row.sender_bot_id == null ? null : canonicalInteger(row.sender_bot_id, 'ETM MsgLog sender_bot_id'),
+  }))
 }
 
-export async function resolveVerifiedBots(
-  client: { getEntity: (entity: string) => Promise<unknown> },
-  main: string,
-  auxiliary: string[],
-): Promise<VerifiedBot[]> {
-  const names = normalizeBotUsernames(main, auxiliary)
-  const resolved: VerifiedBot[] = []
-  const ids = new Set<string>()
-  for (const [index, username] of [names.main, ...names.auxiliary].entries()) {
-    const entity = await client.getEntity(`@${username}`)
-    const entityUsername = entity instanceof Api.User ? entity.username?.toLowerCase() : undefined
-    if (!(entity instanceof Api.User) || !entity.bot || entityUsername !== username)
-      throw new Error(`Telegram username @${username} did not resolve to the requested bot user`)
-    const id = entity.id.toString()
-    if (ids.has(id))
-      throw new Error(`Telegram bot usernames resolved to duplicate user ID ${id}`)
-    ids.add(id)
-    resolved.push({ id, username, senderBotId: index === 0 ? null : id })
+function archiveIdentity(value: string, groups: Set<string>): string | undefined {
+  const separator = value.lastIndexOf('.')
+  if (separator <= 0)
+    return undefined
+  try {
+    const chatId = canonicalInteger(value.slice(0, separator), 'ETM MsgLog chat ID')
+    const messageId = canonicalInteger(value.slice(separator + 1), 'ETM MsgLog message ID')
+    return groups.has(chatId) && BigInt(messageId) > 0n ? `${chatId}.${messageId}` : undefined
   }
-  return resolved
+  catch {
+    return undefined
+  }
+}
+
+export function inferSenderRoles(evidence: SenderEvidence[], messages: Map<string, AcquiredMessage>, groupIds: string[]): Map<string, string | null> {
+  const groups = new Set(groupIds)
+  const roles = new Map<string, string | null>()
+  const addRole = (senderId: string, role: string | null) => {
+    const existing = roles.get(senderId)
+    if (roles.has(senderId) && existing !== role)
+      throw new Error(`Contradictory main and auxiliary ETM sender evidence for Telegram user ${senderId}`)
+    roles.set(senderId, role)
+  }
+  for (const row of evidence) {
+    const archived = [row.primaryIdentity, row.alternateIdentity]
+      .filter((identity): identity is string => identity !== null)
+      .map(identity => archiveIdentity(identity, groups))
+      .filter((identity): identity is string => identity !== undefined)
+      .map(identity => messages.get(identity))
+      .filter((message): message is AcquiredMessage => message !== undefined)
+    const senders = [...new Set(archived.map(message => message.senderId).filter((id): id is string => id !== undefined))]
+    if (senders.length > 1)
+      throw new Error(`Existing ETM MsgLog identities contradict archive sender evidence for ${row.primaryIdentity}`)
+    if (row.senderBotId !== null) {
+      if (senders.length === 1 && senders[0] !== row.senderBotId)
+        throw new Error(`ETM auxiliary sender evidence contradicts archive sender for ${row.primaryIdentity}`)
+      addRole(row.senderBotId, row.senderBotId)
+    }
+    else if (senders.length === 1) {
+      addRole(senders[0], null)
+    }
+  }
+  return roles
+}
+
+async function resolveBot(client: { getEntity: (entity: Api.TypePeer) => Promise<unknown> }, id: string): Promise<boolean> {
+  try {
+    const entity = await client.getEntity(new Api.PeerUser({ userId: bigInt(id) }))
+    return entity instanceof Api.User && entity.bot === true && entity.id.toString() === id
+  }
+  catch {
+    return false
+  }
 }
 
 function rawPeerId(peer: Api.TypePeer): string | undefined {
@@ -478,6 +506,7 @@ function emptyCounts(): RecoveryRepairCounts {
     'inserted': 0,
     'unbound-topic': 0,
     'human-or-unverified-sender': 0,
+    'unclassified-verified-bot': 0,
     'service-deleted-unusable': 0,
     'concurrent': 0,
     'conflicts': 0,
@@ -500,11 +529,13 @@ export function createRecoveryRepairService(options: {
   const inserter = options.insert ?? insertRepairCandidates
 
   return async function* repairRecovery(input: RecoveryRepairInput, signal?: AbortSignal): AsyncGenerator<RecoveryRepairUpdate> {
+    const fromMs = Date.parse(RECOVERY_REPAIR_FROM_ISO)
+    const toMs = input.startedAtMs
+    if (!Number.isFinite(toMs) || toMs <= fromMs)
+      throw new Error(`Recovery repair clock must be later than ${RECOVERY_REPAIR_FROM_ISO}`)
     const taskId = uuidv4()
     yield { type: 'started', taskId }
     const before = await inspector(input.etm)
-    const bots = await resolveVerifiedBots(context.getClient(), input.mainBotUsername, input.auxiliaryBotUsernames)
-    const botsById = new Map(bots.map(bot => [bot.id, bot]))
     const groups = [...new Set(before.bindings.map(binding => binding.topicChatId))]
       .map(parseEtmGroupId)
       .sort((a, b) => BigInt(a.topicChatId) < BigInt(b.topicChatId) ? -1 : 1)
@@ -528,8 +559,8 @@ export function createRecoveryRepairService(options: {
         for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
           pagination: { limit: 100, offset: 0 },
           inputPeer,
-          startTime: input.fromMs,
-          endTime: input.toMs - 1,
+          startTime: fromMs,
+          endTime: toMs - 1,
           skipMedia: true,
           expectedCount: 0,
           disableAutoProgress: true,
@@ -537,7 +568,7 @@ export function createRecoveryRepairService(options: {
           task,
         })) {
           const timestamp = message.date * 1000
-          if (timestamp < input.fromMs || timestamp >= input.toMs)
+          if (timestamp < fromMs || timestamp >= toMs)
             continue
           if (rawPeerId(message.peerId) !== group.sourceChatId)
             throw new Error(`Telegram returned message ${message.id} from an unexpected group`)
@@ -569,15 +600,16 @@ export function createRecoveryRepairService(options: {
     if (!sameBindings(before.bindings, after.bindings))
       throw new Error('ETM TopicAssoc mappings changed during Telegram acquisition; repair aborted')
 
+    const roles = inferSenderRoles(after.senderEvidence, messages, groups.map(group => group.topicChatId))
+    for (const senderId of [...roles.keys()].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1)) {
+      if (!await resolveBot(context.getClient(), senderId))
+        throw new Error(`ETM sender evidence ${senderId} did not resolve to a Telegram bot user`)
+    }
+    const unknownSenderIsBot = new Map<string, boolean>()
     const bindings = new Map(after.bindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, binding]))
     const candidates: RepairCandidate[] = []
     for (const message of [...messages.values()].sort(compareMessages)) {
-      const bot = message.senderId ? botsById.get(message.senderId) : undefined
-      if (!bot) {
-        counts['human-or-unverified-sender'] += 1
-        continue
-      }
-      if (!message.topicId) {
+      if (!message.senderId || !message.topicId || !message.text.trim()) {
         counts['service-deleted-unusable'] += 1
         continue
       }
@@ -586,16 +618,21 @@ export function createRecoveryRepairService(options: {
         counts['unbound-topic'] += 1
         continue
       }
-      if (!message.text.trim()) {
-        counts['service-deleted-unusable'] += 1
+      if (!roles.has(message.senderId)) {
+        let verifiedBot = unknownSenderIsBot.get(message.senderId)
+        if (verifiedBot === undefined) {
+          verifiedBot = await resolveBot(context.getClient(), message.senderId)
+          unknownSenderIsBot.set(message.senderId, verifiedBot)
+        }
+        counts[verifiedBot ? 'unclassified-verified-bot' : 'human-or-unverified-sender'] += 1
         continue
       }
       candidates.push({
         identity: `${message.topicChatId}.${message.messageId}`,
         topicChatId: message.topicChatId,
         messageId: message.messageId,
-        senderId: bot.id,
-        senderBotId: bot.senderBotId,
+        senderId: message.senderId,
+        senderBotId: roles.get(message.senderId) ?? null,
         timestamp: message.timestamp,
         text: message.text,
         binding,
@@ -622,10 +659,10 @@ export function createRecoveryRepairService(options: {
     const summary: RecoveryRepairSummary = {
       version: 1,
       backend: input.etm.backend,
-      window: { from: new Date(input.fromMs).toISOString(), to: new Date(input.toMs).toISOString(), semantics: '[from,to)' },
+      window: { from: RECOVERY_REPAIR_FROM_ISO, to: new Date(toMs).toISOString(), semantics: '[from,to)' },
       groups: groups.map(group => group.topicChatId),
-      mainBotId: bots[0].id,
-      auxiliaryBotIds: bots.slice(1).map(bot => bot.id),
+      mainBotIds: [...roles].filter(([, role]) => role === null).map(([id]) => id).sort(),
+      auxiliaryBotIds: [...roles].filter(([, role]) => role !== null).map(([id]) => id).sort(),
       counts,
       examined: messages.size,
     }

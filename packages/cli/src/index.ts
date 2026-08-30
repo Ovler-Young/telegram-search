@@ -9,6 +9,7 @@ import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 
 import { retryTelegramResult, toAppError } from '@tg-search/core'
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { defineCommand, runMain } from 'citty'
 import { TelegramClient } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
@@ -43,31 +44,6 @@ function stringArg(value: string | boolean | string[] | undefined): string {
   return ''
 }
 
-function stringArgs(value: string | boolean | string[] | undefined): string[] {
-  if (typeof value === 'string')
-    return [value]
-  return Array.isArray(value) ? value : []
-}
-
-const RECOVERY_BOT_USERNAME = /^[a-z]\w{1,28}bot$/i
-
-export function normalizeRecoveryBotUsernames(main: string, auxiliary: string[]): { main: string, auxiliary: string[] } {
-  const normalize = (value: string) => value.trim().replace(/^@/, '').toLowerCase()
-  const normalizedMain = normalize(main)
-  const normalizedAuxiliary = auxiliary.map(normalize)
-  for (const username of [normalizedMain, ...normalizedAuxiliary]) {
-    if (!RECOVERY_BOT_USERNAME.test(username))
-      throw new Error(`Invalid Telegram bot username: ${username || '<empty>'}`)
-  }
-  const seen = new Set([normalizedMain])
-  for (const username of normalizedAuxiliary) {
-    if (seen.has(username))
-      throw new Error(`Duplicate Telegram bot username: ${username}`)
-    seen.add(username)
-  }
-  return { main: normalizedMain, auxiliary: normalizedAuxiliary }
-}
-
 function parseTimestamp(value: string | undefined): number | undefined {
   if (!value)
     return undefined
@@ -83,43 +59,6 @@ function parseTimestamp(value: string | undefined): number | undefined {
 function parseChatIds(value: string | undefined): string[] | undefined {
   const ids = value?.split(',').map(item => item.trim()).filter(Boolean)
   return ids?.length ? ids : undefined
-}
-
-const RECOVERY_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|([+-])(\d{2}):(\d{2}))$/
-
-export function parseRecoveryTimestamp(value: string, option: '--from' | '--to'): number {
-  const match = RECOVERY_TIMESTAMP.exec(value)
-  if (!match)
-    throw new Error(`${option} requires an ISO 8601 timestamp with an explicit timezone offset`)
-
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0', fractionText = '', zone, sign, offsetHourText = '0', offsetMinuteText = '0'] = match
-  const year = Number(yearText)
-  const month = Number(monthText)
-  const day = Number(dayText)
-  const hour = Number(hourText)
-  const minute = Number(minuteText)
-  const second = Number(secondText)
-  const millisecond = Number(fractionText.padEnd(3, '0'))
-  const offsetHour = Number(offsetHourText)
-  const offsetMinute = Number(offsetMinuteText)
-  if (offsetHour > 23 || offsetMinute > 59)
-    throw new Error(`Invalid timestamp for ${option}: ${value}`)
-  const offset = zone === 'Z' ? 0 : (sign === '-' ? -1 : 1) * (offsetHour * 60 + offsetMinute)
-  const localMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond)
-  const parsed = localMs - offset * 60_000
-  const normalized = new Date(parsed + offset * 60_000)
-  if (
-    normalized.getUTCFullYear() !== year
-    || normalized.getUTCMonth() !== month - 1
-    || normalized.getUTCDate() !== day
-    || normalized.getUTCHours() !== hour
-    || normalized.getUTCMinutes() !== minute
-    || normalized.getUTCSeconds() !== second
-    || normalized.getUTCMilliseconds() !== millisecond
-  ) {
-    throw new Error(`Invalid timestamp for ${option}: ${value}`)
-  }
-  return parsed
 }
 
 export function parseRecoveryEtmSource(sqlitePath: string, postgresUrl: string) {
@@ -578,38 +517,26 @@ const recoveryCommand = defineCommand({
       args: {
         'etm-sqlite': { type: 'string' },
         'etm-postgres-url': { type: 'string' },
-        'from': { type: 'string', required: true },
-        'to': { type: 'string', required: true },
-        'main-bot-username': { type: 'string', required: true },
-        'aux-bot-username': { type: 'string' },
         'chunk-size': { type: 'string', default: '250' },
         'output': { type: 'string' },
         'takeout': { type: 'boolean', default: false },
         ...profileArg,
       },
       async run(context) {
+        const startedAtMs = Date.now()
+        if (!Number.isFinite(startedAtMs) || startedAtMs <= Date.parse(RECOVERY_REPAIR_FROM_ISO))
+          throw new Error(`Recovery repair clock must be later than ${RECOVERY_REPAIR_FROM_ISO}`)
         const profile = profileFrom(context)
-        const fromMs = parseRecoveryTimestamp(stringArg(context.args.from), '--from')
-        const toMs = parseRecoveryTimestamp(stringArg(context.args.to), '--to')
-        if (fromMs >= toMs)
-          throw new Error('Recovery repair requires --from to be earlier than --to')
         const sqlitePath = stringArg(context.args['etm-sqlite'])
         const postgresUrl = stringArg(context.args['etm-postgres-url'])
         const chunkSize = Number(stringArg(context.args['chunk-size']))
         if (!Number.isInteger(chunkSize) || chunkSize <= 0)
           throw new Error('Recovery repair requires --chunk-size to be a positive integer')
         const output = stringArg(context.args.output)
-        const botUsernames = normalizeRecoveryBotUsernames(
-          stringArg(context.args['main-bot-username']),
-          stringArgs(context.args['aux-bot-username']),
-        )
         await withRuntime(profile, true, async (runtime) => {
           await emitStreamResult(runtime.streams.recoveryRepair({
             etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
-            fromMs,
-            toMs,
-            mainBotUsername: botUsernames.main,
-            auxiliaryBotUsernames: botUsernames.auxiliary,
+            startedAtMs,
             chunkSize,
             outputFile: output ? resolve(output) : null,
             takeout: context.args.takeout === true,

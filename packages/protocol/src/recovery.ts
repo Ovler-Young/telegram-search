@@ -3,17 +3,16 @@ import type { InferOutput } from 'valibot'
 import type { AppError } from './errors'
 
 import { defineInvokeEventa } from '@moeru/eventa'
-import { array, boolean, literal, minLength, nullable, number, object, optional, pipe, string, union } from 'valibot'
+import { boolean, literal, minLength, nullable, number, object, optional, pipe, string, union } from 'valibot'
+
+export const RECOVERY_REPAIR_FROM_ISO = '2026-07-13T18:22:03Z'
 
 export const recoveryRepairInputSchema = object({
   etm: union([
     object({ backend: literal('sqlite'), path: pipe(string(), minLength(1)) }),
     object({ backend: literal('postgres'), url: pipe(string(), minLength(1)) }),
   ]),
-  fromMs: number(),
-  toMs: number(),
-  mainBotUsername: pipe(string(), minLength(1)),
-  auxiliaryBotUsernames: array(pipe(string(), minLength(1))),
+  startedAtMs: number(),
   chunkSize: number(),
   outputFile: optional(nullable(pipe(string(), minLength(1)))),
   takeout: boolean(),
@@ -27,6 +26,7 @@ export interface RecoveryRepairCounts {
   'inserted': number
   'unbound-topic': number
   'human-or-unverified-sender': number
+  'unclassified-verified-bot': number
   'service-deleted-unusable': number
   'concurrent': number
   'conflicts': number
@@ -38,7 +38,7 @@ export interface RecoveryRepairSummary {
   backend: 'sqlite' | 'postgres'
   window: { from: string, to: string, semantics: '[from,to)' }
   groups: string[]
-  mainBotId: string
+  mainBotIds: string[]
   auxiliaryBotIds: string[]
   counts: RecoveryRepairCounts
   examined: number
