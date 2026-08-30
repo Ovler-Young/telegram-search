@@ -8,9 +8,6 @@ WORKDIR /app
 RUN corepack enable pnpm && \
     corepack prepare pnpm@10.22.0 --activate
 
-# Install build tools
-RUN apk add --no-cache git
-
 # Copy dependency manifests
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/core/package.json ./packages/core/package.json
@@ -41,23 +38,10 @@ RUN pnpm run web:build
 # ---------------------------------
 FROM node:24.13.0-bookworm-slim AS recovery
 
-ARG ETM_IMPORTER_REF=db843a01ebc4bb399277c4614c39a6ee159c89e4
-ARG ETM_PROFILE=recovery
-
 WORKDIR /app
 
 RUN corepack enable pnpm && \
-    corepack prepare pnpm@10.22.0 --activate && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends git libmagic1 python3 python3-venv && \
-    rm -rf /var/lib/apt/lists/* && \
-    python3 -m venv /opt/etm && \
-    mkdir -p "/var/lib/efb/profiles/${ETM_PROFILE}/blueset.telegram"
-
-ENV PATH="/opt/etm/bin:${PATH}"
-
-RUN pip install --no-cache-dir \
-    "efb-telegram-master[postgresql] @ git+https://github.com/Ovler-Young/efb-telegram-master.git@${ETM_IMPORTER_REF}"
+    corepack prepare pnpm@10.22.0 --activate
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/common/package.json ./packages/common/package.json

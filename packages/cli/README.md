@@ -84,62 +84,63 @@ tg-search --profile work messages list --chat 123456 --sender me --to 2026-01-31
 
 ## Docker recovery workflow
 
-The recovery Compose profile provides explicit, run-once jobs for owner-account authentication, bounded export, and ETM import. The recovery image builds the `tg-search` CLI and installs `etm-msglog-import` from `Ovler-Young/efb-telegram-master` commit `db843a01ebc4bb399277c4614c39a6ee159c89e4` by default. Set `ETM_IMPORTER_REF` during the build only when deliberately testing another reachable ETM revision.
+The recovery Compose profile provides explicit, run-once jobs for owner-account authentication and read-only comparison with an ETM database. ETM's existing `TopicAssoc` rows select the Telegram groups and topics to inspect. The audit reads Telegram history and a consistent ETM snapshot, then writes non-importable diagnostic evidence; it never inserts, updates, or deletes `MsgLog` rows. Base ETM records do not preserve enough recoverable slave-message identity to construct authoritative `MsgLog` entries, so the workflow performs no recovery writes.
 
-Create a private working directory. The chat file accepts one non-zero signed decimal Telegram chat ID per line. Blank lines, full-line comments, and trailing `#` comments are allowed:
-
-```text
-# Supergroup and basic-group examples
--1000000000001 # supergroup
--123456789      # basic group
-```
-
-The exporter and importer mount this same file read-only. The artifact directory is writable only for export and read-only for import. The named `recovery_owner_data` volume retains the owner profile and Telegram StringSession between authentication and export; it is not part of the image.
-
-Set the host paths and non-secret recovery parameters in the shell. Paths are resolved relative to `docker/docker-compose.recovery.yml`; the shown absolute paths avoid ambiguity. `RECOVERY_FROM` is inclusive and `RECOVERY_TO` is exclusive, so the exported window is `[from,to)`. Both boundaries must include an explicit time-zone offset.
+Create a private report directory and set the bounded interval. `RECOVERY_FROM` is inclusive and `RECOVERY_TO` is exclusive, so the audited window is `[from,to)`. Both boundaries must include `Z` or an explicit numeric offset. `RECOVERY_REPORT_FILE` must be a filename within `RECOVERY_REPORT_DIR`.
 
 ```bash
-mkdir -p "$PWD/recovery"
-chmod 700 "$PWD/recovery"
+mkdir -p "$PWD/recovery-reports"
+chmod 700 "$PWD/recovery-reports"
 
 export RECOVERY_PROFILE=recovery
-export RECOVERY_CHAT_FILE="$PWD/recovery/chat-ids.txt"
-export RECOVERY_ARTIFACT_DIR="$PWD/recovery"
-export RECOVERY_ARTIFACT_FILE=recovery.jsonl
+export RECOVERY_REPORT_DIR="$PWD/recovery-reports"
+export RECOVERY_REPORT_FILE=etm-audit.jsonl
 export RECOVERY_FROM=2026-01-01T00:00:00Z
 export RECOVERY_TO=2027-01-01T00:00:00Z
 export TELEGRAM_API_ID='<telegram-api-id>'
 export TELEGRAM_API_HASH='<telegram-api-hash>'
 ```
 
-Build, authenticate interactively, then export. Running the export job with its built-in `--takeout` means the owner has approved the selected bounded export. If Telegram requests a separate Takeout confirmation, approve it in Telegram and rerun the export job; the job does not retry automatically.
+Build and authenticate interactively. The named `recovery_owner_data` volume retains the owner profile and Telegram StringSession between commands; neither is copied into the image.
 
 ```bash
 docker compose -f docker/docker-compose.recovery.yml --profile recovery build
 docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-auth
-docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-export
 ```
 
-The output is one version-1 JSONL file. Its first line is the manifest and the remaining lines are deterministically ordered messages. It contains message text and recovery metadata, not media binaries or credentials.
+The authentication service runs `tg-search --profile recovery auth login` when `RECOVERY_PROFILE=recovery`.
 
-For SQLite, point the job at the existing ETM profile config and database file. The config is mounted read-only and the database file is mounted read-write at ETM's established `profiles/<profile>/blueset.telegram/tgdata.db` path:
+For SQLite, provide the existing ETM database file. Compose mounts it read-only at `/etm/tgdata.db`; the report directory is the only writable bind mount.
 
 ```bash
-export RECOVERY_ETM_CONFIG_FILE='/absolute/path/to/config.yaml'
 export RECOVERY_ETM_SQLITE_DB_FILE='/absolute/path/to/tgdata.db'
-docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-import-sqlite
+docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-audit-sqlite
 ```
 
-For PostgreSQL, use an ETM `config.yaml` whose established `database` section selects `type: postgresql` and supplies the database name, host, port, user, and password. The PostgreSQL job mounts that config read-only and makes the configured connection directly; it does not mount a SQLite database:
+For PostgreSQL, supply the DSN only in the runtime environment. The job mounts no ETM config or database file.
 
 ```bash
-export RECOVERY_ETM_CONFIG_FILE='/absolute/path/to/postgresql-config.yaml'
-docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-import-postgresql
+export RECOVERY_ETM_POSTGRES_URL='postgresql://user:password@host:5432/database'
+docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-audit-postgresql
 ```
 
-The ETM profile name must equal `RECOVERY_PROFILE`, because the importer validates it against the artifact owner profile. Both ETM backends import only configured bot senders and existing topic associations and print a JSON summary. `RECOVERY_CHUNK_SIZE` optionally changes the default 250-row transaction size.
+Both audit jobs run the following bounded command with the selected database option and fixed container paths:
 
-Keep the Telegram API hash, ETM bot tokens, PostgreSQL password, owner session volume, artifact, and SQLite database private. Do not commit or bake them into an image. Restrict the host files to the account performing recovery and remove exported artifacts when they are no longer needed. Each job exits after its command; the Compose profile defines no restart policy or scheduler.
+```bash
+tg-search recovery audit \
+  --profile recovery \
+  --etm-sqlite /etm/tgdata.db \
+  --from 2026-01-01T00:00:00Z \
+  --to 2027-01-01T00:00:00Z \
+  --output /reports/etm-audit.jsonl \
+  --takeout
+```
+
+The PostgreSQL job uses the same bounds and output path, replacing `--etm-sqlite /etm/tgdata.db` with `--etm-postgres-url "$RECOVERY_ETM_POSTGRES_URL"`.
+
+`--takeout` requires owner approval. If Telegram requests a separate Takeout confirmation, approve it in Telegram and rerun the audit job; the job does not retry automatically. The report classifies observed messages against the ETM snapshot and is diagnostic evidence only. It is not accepted by an importer and contains message identifiers and recovery metadata that should remain private.
+
+Keep the Telegram API hash, PostgreSQL DSN, owner session volume, report, and SQLite database private. Do not commit or bake them into an image. Restrict host files and the report directory to the account performing the audit. Each service exits after its command; the Compose profile defines no restart policy or scheduler.
 
 ## Annual export
 
