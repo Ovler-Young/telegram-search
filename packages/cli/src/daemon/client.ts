@@ -53,7 +53,7 @@ export async function connectDaemon(paths: ProfilePaths): Promise<DaemonClientRu
           },
           streams: {
             export: defineStreamInvoke(connection.context, exportContracts.run),
-            recoveryExport: defineStreamInvoke(connection.context, recoveryContracts.export),
+            recoveryAudit: defineStreamInvoke(connection.context, recoveryContracts.audit),
             sync: defineStreamInvoke(connection.context, syncContracts.run),
           },
           close: () => connection.dispose(),

@@ -4,9 +4,6 @@ x-recovery-build: &recovery-build
   context: ..
   dockerfile: docker/Dockerfile
   target: recovery
-  args:
-    ETM_IMPORTER_REF: ${ETM_IMPORTER_REF:-db843a01ebc4bb399277c4614c39a6ee159c89e4}
-    ETM_PROFILE: ${RECOVERY_PROFILE:-recovery}
 
 x-owner-environment: &owner-environment
   TG_SEARCH_HOME: /var/lib/tg-search
@@ -14,26 +11,11 @@ x-owner-environment: &owner-environment
   TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
   TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
 
-x-chat-file: &chat-file
+x-report-directory: &report-directory
   type: bind
-  source: ${RECOVERY_CHAT_FILE:-../recovery/chat-ids.txt}
-  target: /recovery/chat-ids.txt
-  read_only: true
-  bind:
-    create_host_path: false
-
-x-artifact-directory: &artifact-directory
-  type: bind
-  source: ${RECOVERY_ARTIFACT_DIR:-../recovery}
-  target: /recovery
-  bind:
-    create_host_path: false
-
-x-etm-config: &etm-config
-  type: bind
-  source: ${RECOVERY_ETM_CONFIG_FILE:-../recovery/etm-config.yaml}
-  target: /var/lib/efb/profiles/${RECOVERY_PROFILE:-recovery}/blueset.telegram/config.yaml
-  read_only: true
+  source: ${RECOVERY_REPORT_DIR:-/tmp}
+  target: /reports
+  read_only: false
   bind:
     create_host_path: false
 
@@ -55,52 +37,23 @@ services:
         : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
         exec tg-search --profile "$${RECOVERY_PROFILE}" auth login
 
-  recovery-export:
+  recovery-audit-sqlite:
     profiles: [recovery]
     build: *recovery-build
     environment:
       <<: *owner-environment
       RECOVERY_FROM: ${RECOVERY_FROM:-}
       RECOVERY_TO: ${RECOVERY_TO:-}
-      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
+      RECOVERY_REPORT_DIR: ${RECOVERY_REPORT_DIR:-}
+      RECOVERY_REPORT_FILE: ${RECOVERY_REPORT_FILE:-}
+      RECOVERY_ETM_SQLITE_DB_FILE: ${RECOVERY_ETM_SQLITE_DB_FILE:-}
     volumes:
       - recovery_owner_data:/var/lib/tg-search
-      - *chat-file
-      - *artifact-directory
-    command:
-      - /bin/sh
-      - -eu
-      - -c
-      - |
-        : "$${TELEGRAM_API_ID:?Set TELEGRAM_API_ID}"
-        : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
-        : "$${RECOVERY_FROM:?Set RECOVERY_FROM to an ISO 8601 timestamp}"
-        : "$${RECOVERY_TO:?Set RECOVERY_TO to an ISO 8601 timestamp}"
-        exec tg-search recovery export \
-          --profile "$${RECOVERY_PROFILE}" \
-          --chat-file /recovery/chat-ids.txt \
-          --from "$${RECOVERY_FROM}" \
-          --to "$${RECOVERY_TO}" \
-          --output "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
-          --takeout
-
-  recovery-import-sqlite:
-    profiles: [recovery]
-    build: *recovery-build
-    environment:
-      EFB_DATA_PATH: /var/lib/efb
-      RECOVERY_PROFILE: ${RECOVERY_PROFILE:-recovery}
-      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
-      RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
-    volumes:
-      - *chat-file
-      - <<: *artifact-directory
-        read_only: true
-      - *etm-config
+      - *report-directory
       - type: bind
-        source: ${RECOVERY_ETM_SQLITE_DB_FILE:-../recovery/tgdata.db}
-        target: /var/lib/efb/profiles/${RECOVERY_PROFILE:-recovery}/blueset.telegram/tgdata.db
-        read_only: false
+        source: ${RECOVERY_ETM_SQLITE_DB_FILE:-/dev/null}
+        target: /etm/tgdata.db
+        read_only: true
         bind:
           create_host_path: false
     command:
@@ -108,35 +61,59 @@ services:
       - -eu
       - -c
       - |
-        exec etm-msglog-import \
+        : "$${TELEGRAM_API_ID:?Set TELEGRAM_API_ID}"
+        : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
+        : "$${RECOVERY_FROM:?Set RECOVERY_FROM to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_TO:?Set RECOVERY_TO to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_REPORT_DIR:?Set RECOVERY_REPORT_DIR to an existing report directory}"
+        : "$${RECOVERY_REPORT_FILE:?Set RECOVERY_REPORT_FILE to a report filename}"
+        : "$${RECOVERY_ETM_SQLITE_DB_FILE:?Set RECOVERY_ETM_SQLITE_DB_FILE to the ETM SQLite database}"
+        case "$${RECOVERY_REPORT_FILE}" in
+          */*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
+        esac
+        exec tg-search recovery audit \
           --profile "$${RECOVERY_PROFILE}" \
-          --artifact "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
-          --chat-file /recovery/chat-ids.txt \
-          --chunk-size "$${RECOVERY_CHUNK_SIZE}"
+          --etm-sqlite /etm/tgdata.db \
+          --from "$${RECOVERY_FROM}" \
+          --to "$${RECOVERY_TO}" \
+          --output "/reports/$${RECOVERY_REPORT_FILE}" \
+          --takeout
 
-  recovery-import-postgresql:
+  recovery-audit-postgresql:
     profiles: [recovery]
     build: *recovery-build
     environment:
-      EFB_DATA_PATH: /var/lib/efb
-      RECOVERY_PROFILE: ${RECOVERY_PROFILE:-recovery}
-      RECOVERY_ARTIFACT_FILE: ${RECOVERY_ARTIFACT_FILE:-recovery.jsonl}
-      RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
+      <<: *owner-environment
+      RECOVERY_FROM: ${RECOVERY_FROM:-}
+      RECOVERY_TO: ${RECOVERY_TO:-}
+      RECOVERY_REPORT_DIR: ${RECOVERY_REPORT_DIR:-}
+      RECOVERY_REPORT_FILE: ${RECOVERY_REPORT_FILE:-}
+      RECOVERY_ETM_POSTGRES_URL: ${RECOVERY_ETM_POSTGRES_URL:-}
     volumes:
-      - *chat-file
-      - <<: *artifact-directory
-        read_only: true
-      - *etm-config
+      - recovery_owner_data:/var/lib/tg-search
+      - *report-directory
     command:
       - /bin/sh
       - -eu
       - -c
       - |
-        exec etm-msglog-import \
+        : "$${TELEGRAM_API_ID:?Set TELEGRAM_API_ID}"
+        : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
+        : "$${RECOVERY_FROM:?Set RECOVERY_FROM to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_TO:?Set RECOVERY_TO to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_REPORT_DIR:?Set RECOVERY_REPORT_DIR to an existing report directory}"
+        : "$${RECOVERY_REPORT_FILE:?Set RECOVERY_REPORT_FILE to a report filename}"
+        : "$${RECOVERY_ETM_POSTGRES_URL:?Set RECOVERY_ETM_POSTGRES_URL to the ETM PostgreSQL DSN}"
+        case "$${RECOVERY_REPORT_FILE}" in
+          */*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
+        esac
+        exec tg-search recovery audit \
           --profile "$${RECOVERY_PROFILE}" \
-          --artifact "/recovery/$${RECOVERY_ARTIFACT_FILE}" \
-          --chat-file /recovery/chat-ids.txt \
-          --chunk-size "$${RECOVERY_CHUNK_SIZE}"
+          --etm-postgres-url "$${RECOVERY_ETM_POSTGRES_URL}" \
+          --from "$${RECOVERY_FROM}" \
+          --to "$${RECOVERY_TO}" \
+          --output "/reports/$${RECOVERY_REPORT_FILE}" \
+          --takeout
 
 volumes:
   recovery_owner_data:
