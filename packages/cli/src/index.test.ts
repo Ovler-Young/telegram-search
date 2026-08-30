@@ -11,7 +11,6 @@ import {
   emitResult,
   emitStreamResult,
   normalizeRawArgs,
-  parseRecoveryEtmSource,
   resolveExportOutputPath,
   runCli,
 } from './index'
@@ -39,9 +38,9 @@ function captureOutput() {
 
 describe('cLI command boundary', () => {
   it('does not accept caller-supplied recovery window or bot-role options', async () => {
-    for (const option of ['--from', '--to', '--main-bot-username', '--aux-bot-username']) {
+    for (const option of ['--from', '--to', '--main-bot-username', '--aux-bot-username', '--etm-postgres-url']) {
       const output = captureOutput()
-      await runCli(['recovery', 'repair', '--etm-sqlite', '/unused', option, 'value', '--takeout'])
+      await runCli(['recovery', 'repair', '--etm-config', '/unused', '--etm-sqlite', '/unused', option, 'value', '--takeout'])
       expect(output.stdoutJson()).toMatchObject({ ok: false })
       vi.restoreAllMocks()
       process.exitCode = originalExitCode
@@ -51,20 +50,9 @@ describe('cLI command boundary', () => {
   it('captures the recovery upper bound once before command validation', async () => {
     const output = captureOutput()
     const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(RECOVERY_REPAIR_FROM_ISO) + 1)
-    await runCli(['recovery', 'repair', '--etm-sqlite', '/unused', '--chunk-size', '0', '--takeout'])
+    await runCli(['recovery', 'repair', '--etm-config', '/unused', '--etm-sqlite', '/unused', '--chunk-size', '0', '--takeout'])
     expect(now).toHaveBeenCalledOnce()
     expect(output.stdoutJson()).toMatchObject({ ok: false })
-  })
-
-  it('requires exactly one ETM database source', () => {
-    const sqlitePath = resolve(process.cwd(), 'test-etm.db')
-    expect(parseRecoveryEtmSource(sqlitePath, '')).toEqual({ backend: 'sqlite', path: sqlitePath })
-    expect(parseRecoveryEtmSource('', 'postgresql://localhost/etm')).toEqual({
-      backend: 'postgres',
-      url: 'postgresql://localhost/etm',
-    })
-    expect(() => parseRecoveryEtmSource('', '')).toThrow('exactly one')
-    expect(() => parseRecoveryEtmSource(sqlitePath, 'postgresql://localhost/etm')).toThrow('exactly one')
   })
 
   it('resolves explicit export paths in the invoking process', () => {

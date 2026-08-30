@@ -14,18 +14,17 @@ import bigInt from 'big-integer'
 
 import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { EventEmitter } from 'eventemitter3'
-import { Client } from 'pg'
+import { Pool } from 'pg'
 import { Api } from 'telegram'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createRecoveryRepairService,
-  inferSenderRoles,
   insertRepairCandidates,
   inspectEtm,
   normalizeBindings,
-  normalizeSenderEvidence,
   parseEtmGroupId,
+  postgresPoolConfig,
   readInitialPresences,
 } from '../recovery-repair'
 
@@ -97,28 +96,6 @@ describe('eTM discovery and bot identity', () => {
     ])).toThrow('Unusable')
   })
 
-  it('infers main and auxiliary roles through primary and alternate MsgLog identities', () => {
-    const messages = new Map([
-      ['-1000000000042.11', { topicChatId: '-1000000000042', sourceChatId: '42', messageId: '11', senderId: '9', timestamp: 1, text: 'main' }],
-      ['-1000000000042.12', { topicChatId: '-1000000000042', sourceChatId: '42', messageId: '12', senderId: '10', timestamp: 1, text: 'aux' }],
-    ])
-    const evidence = normalizeSenderEvidence([
-      { master_msg_id: '-1000000000042.11', master_msg_id_alt: null, sender_bot_id: null },
-      { master_msg_id: 'legacy', master_msg_id_alt: '-1000000000042.12', sender_bot_id: '10' },
-    ])
-    expect(inferSenderRoles(evidence, messages, ['-1000000000042'])).toEqual(new Map([['9', null], ['10', '10']]))
-    expect(() => inferSenderRoles([
-      ...evidence,
-      { primaryIdentity: '-1000000000042.11', alternateIdentity: null, senderBotId: '9' },
-    ], messages, ['-1000000000042'])).toThrow('Contradictory')
-    expect(() => inferSenderRoles([
-      { primaryIdentity: '-1000000000042.11', alternateIdentity: null, senderBotId: '10' },
-    ], messages, ['-1000000000042'])).toThrow('contradicts archive sender')
-    expect(() => inferSenderRoles([
-      { primaryIdentity: '-1000000000042.11', alternateIdentity: '-1000000000042.12', senderBotId: null },
-    ], messages, ['-1000000000042'])).toThrow('identities contradict archive sender')
-  })
-
   it('validates a real SQLite schema and checks both MsgLog identity columns', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
     temporaryDirectories.push(directory)
@@ -130,7 +107,6 @@ describe('eTM discovery and bot identity', () => {
 
     await expect(inspectEtm({ backend: 'sqlite', path })).resolves.toEqual({
       bindings: [{ topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' }],
-      senderEvidence: [{ primaryIdentity: '-1000000000042.11', alternateIdentity: '-1000000000042.12', senderBotId: null }],
     })
     await expect(readInitialPresences({ backend: 'sqlite', path }, [
       '-1000000000042.11',
@@ -145,7 +121,17 @@ describe('eTM discovery and bot identity', () => {
 
   it.runIf(Boolean(process.env.RECOVERY_REPAIR_POSTGRES_URL))('validates the configured real PostgreSQL ETM schema', async () => {
     await expect(
-      inspectEtm({ backend: 'postgres', url: process.env.RECOVERY_REPAIR_POSTGRES_URL! }),
+      inspectEtm({
+        backend: 'postgres',
+        database: 'efb_telegram',
+        host: 'localhost',
+        port: 5432,
+        user: 'postgres',
+        password: '',
+        maxConnections: 8,
+        staleTimeout: 300,
+        options: '-c timezone=UTC',
+      }),
     ).resolves.toMatchObject({ bindings: expect.any(Array) })
   })
 })
@@ -163,6 +149,8 @@ describe('bounded recovery repair', () => {
     })
     const iterator = service({
       etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
       startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO),
       chunkSize: 10,
       outputFile: null,
@@ -238,6 +226,8 @@ describe('bounded recovery repair', () => {
     })
     const input = {
       etm: { backend: 'sqlite' as const, path },
+      mainBotId: '9',
+      auxiliaryBotIds: ['10'],
       startedAtMs: toMs,
       chunkSize: 1,
       outputFile: output,
@@ -263,8 +253,7 @@ describe('bounded recovery repair', () => {
           'present-alt': 1,
           'inserted': 2,
           'unbound-topic': 1,
-          'human-or-unverified-sender': 1,
-          'unclassified-verified-bot': 1,
+          'human-or-unconfigured-sender': 2,
           'service-deleted-unusable': 1,
           'concurrent': 0,
           'conflicts': 0,
@@ -322,13 +311,14 @@ describe('bounded recovery repair', () => {
       slaveModule: 'slave.module',
     }]
     const inspect = vi.fn()
-      .mockResolvedValueOnce({ bindings, senderEvidence: [] })
-      .mockResolvedValueOnce({ bindings: [{ ...bindings[0], messageThreadId: '11' }], senderEvidence: [] })
+      .mockResolvedValueOnce({ bindings })
+      .mockResolvedValueOnce({ bindings: [{ ...bindings[0], messageThreadId: '11' }] })
     const insert = vi.fn()
+    const bot = new Api.User({ id: bigInt(9), firstName: 'Main', username: 'main_bot', bot: true })
     const group = new Api.Channel({ id: bigInt(42), accessHash: bigInt(1), title: 'Bound', photo: new Api.ChatPhotoEmpty(), date: 0, megagroup: true })
     const context = {
       emitter: new EventEmitter(),
-      getClient: () => ({ getEntity: vi.fn(async () => group) }),
+      getClient: () => ({ getEntity: vi.fn(async peer => peer instanceof Api.PeerUser ? bot : group) }),
     } as unknown as CoreContext
     const service = createRecoveryRepairService({
       context,
@@ -341,14 +331,44 @@ describe('bounded recovery repair', () => {
     const run = async () => {
       for await (const update of service({
         etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
+        startedAtMs: Date.now(),
+        chunkSize: 10,
+        outputFile: null,
+        takeout: true,
+      })) void update
+      return 'completed'
+    }
+    await expect(run()).rejects.toThrow('changed during Telegram acquisition')
+    expect(insert).not.toHaveBeenCalled()
+  })
+
+  it('rejects a configured identity that is not a matching bot before database inspection', async () => {
+    const inspect = vi.fn()
+    const service = createRecoveryRepairService({
+      context: {
+        emitter: new EventEmitter(),
+        getClient: () => ({ getEntity: vi.fn(async () => new Api.User({ id: bigInt(9), firstName: 'Human', bot: false })) }),
+      } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn() },
+      takeoutService: { takeoutMessages: vi.fn() },
+      inspect,
+    })
+    const run = async () => {
+      for await (const update of service({
+        etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
         startedAtMs: Date.now(),
         chunkSize: 10,
         outputFile: null,
         takeout: true,
       })) void update
     }
-    await expect(run()).rejects.toThrow('changed during Telegram acquisition')
-    expect(insert).not.toHaveBeenCalled()
+    await expect(run()).rejects.toThrow('Configured ETM bot ID 9')
+    expect(inspect).not.toHaveBeenCalled()
   })
 
   it('counts records that become present after the initial snapshot as concurrent conflicts', async () => {
@@ -377,7 +397,6 @@ describe('bounded recovery repair', () => {
       },
       inspect: vi.fn(async () => ({
         bindings: [binding],
-        senderEvidence: [{ primaryIdentity: '-1000000000042.150', alternateIdentity: null, senderBotId: null }],
       })),
       presences: vi.fn(async () => new Map()),
       insert: vi.fn(async () => ({ inserted: 0, concurrent: 1, conflicts: 0, errors: 0 })),
@@ -385,6 +404,8 @@ describe('bounded recovery repair', () => {
     const updates = []
     for await (const update of service({
       etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
       startedAtMs: Date.now(),
       chunkSize: 10,
       outputFile: null,
@@ -394,10 +415,9 @@ describe('bounded recovery repair', () => {
   })
 
   it('uses a short PostgreSQL table-lock transaction and rechecks both identity columns before insertion', async () => {
-    vi.spyOn(Client.prototype, 'connect').mockResolvedValue()
-    vi.spyOn(Client.prototype, 'end').mockResolvedValue()
+    const credential = 'secret'
     const statements: string[] = []
-    vi.spyOn(Client.prototype, 'query').mockImplementation((async (query: unknown) => {
+    const query = vi.fn(async (query: unknown) => {
       const sql = String(query)
       statements.push(sql)
       if (sql.startsWith('SELECT master_msg_id'))
@@ -405,10 +425,34 @@ describe('bounded recovery repair', () => {
       if (sql.startsWith('INSERT INTO msglog'))
         return { rows: [], rowCount: 1 }
       return { rows: [], rowCount: null }
-    }) as never)
+    })
+    vi.spyOn(Pool.prototype, 'connect').mockResolvedValue({ query, release: vi.fn() } as never)
+    vi.spyOn(Pool.prototype, 'end').mockResolvedValue()
     const binding = { topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' }
+    const source = {
+      backend: 'postgres' as const,
+      database: 'custom',
+      host: 'db.internal',
+      port: 5544,
+      user: 'etm',
+      password: credential,
+      maxConnections: 3,
+      staleTimeout: 999,
+      options: '-c timezone=UTC',
+    }
 
-    await expect(insertRepairCandidates({ backend: 'postgres', url: 'postgresql://test' }, [{
+    expect(postgresPoolConfig(source)).toEqual({
+      database: 'custom',
+      host: 'db.internal',
+      port: 5544,
+      user: 'etm',
+      password: credential,
+      max: 3,
+      options: '-c timezone=UTC',
+    })
+    expect(postgresPoolConfig(source)).not.toHaveProperty('idleTimeoutMillis')
+
+    await expect(insertRepairCandidates(source, [{
       identity: '-1000000000042.150',
       topicChatId: '-1000000000042',
       messageId: '150',
