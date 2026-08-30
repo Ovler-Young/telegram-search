@@ -19,6 +19,16 @@ x-report-directory: &report-directory
   bind:
     create_host_path: false
 
+x-repair-environment: &repair-environment
+  <<: *owner-environment
+  RECOVERY_FROM: ${RECOVERY_FROM:-}
+  RECOVERY_TO: ${RECOVERY_TO:-}
+  RECOVERY_MAIN_BOT_USERNAME: ${RECOVERY_MAIN_BOT_USERNAME:-}
+  RECOVERY_AUX_BOT_USERNAMES: ${RECOVERY_AUX_BOT_USERNAMES:-}
+  RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
+  RECOVERY_REPORT_DIR: ${RECOVERY_REPORT_DIR:-}
+  RECOVERY_REPORT_FILE: ${RECOVERY_REPORT_FILE:-}
+
 services:
   recovery-auth:
     profiles: [recovery]
@@ -37,15 +47,11 @@ services:
         : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
         exec tg-search --profile "$${RECOVERY_PROFILE}" auth login
 
-  recovery-audit-sqlite:
+  recovery-repair-sqlite:
     profiles: [recovery]
     build: *recovery-build
     environment:
-      <<: *owner-environment
-      RECOVERY_FROM: ${RECOVERY_FROM:-}
-      RECOVERY_TO: ${RECOVERY_TO:-}
-      RECOVERY_REPORT_DIR: ${RECOVERY_REPORT_DIR:-}
-      RECOVERY_REPORT_FILE: ${RECOVERY_REPORT_FILE:-}
+      <<: *repair-environment
       RECOVERY_ETM_SQLITE_DB_FILE: ${RECOVERY_ETM_SQLITE_DB_FILE:-}
     volumes:
       - recovery_owner_data:/var/lib/tg-search
@@ -53,7 +59,7 @@ services:
       - type: bind
         source: ${RECOVERY_ETM_SQLITE_DB_FILE:-/dev/null}
         target: /etm/tgdata.db
-        read_only: true
+        read_only: false
         bind:
           create_host_path: false
     command:
@@ -65,29 +71,36 @@ services:
         : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
         : "$${RECOVERY_FROM:?Set RECOVERY_FROM to a timezone-aware ISO 8601 timestamp}"
         : "$${RECOVERY_TO:?Set RECOVERY_TO to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_MAIN_BOT_USERNAME:?Set RECOVERY_MAIN_BOT_USERNAME to the ETM main bot username}"
+        : "$${RECOVERY_CHUNK_SIZE:?Set RECOVERY_CHUNK_SIZE to a positive integer}"
         : "$${RECOVERY_REPORT_DIR:?Set RECOVERY_REPORT_DIR to an existing report directory}"
         : "$${RECOVERY_REPORT_FILE:?Set RECOVERY_REPORT_FILE to a report filename}"
         : "$${RECOVERY_ETM_SQLITE_DB_FILE:?Set RECOVERY_ETM_SQLITE_DB_FILE to the ETM SQLite database}"
         case "$${RECOVERY_REPORT_FILE}" in
-          */*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
+          .|..|*/*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
         esac
-        exec tg-search recovery audit \
+        set --
+        while IFS= read -r bot_username; do
+          [ -z "$${bot_username}" ] || set -- "$${@}" --aux-bot-username "$${bot_username}"
+        done <<AUX_BOT_USERNAMES
+        $${RECOVERY_AUX_BOT_USERNAMES}
+        AUX_BOT_USERNAMES
+        exec tg-search recovery repair \
           --profile "$${RECOVERY_PROFILE}" \
           --etm-sqlite /etm/tgdata.db \
           --from "$${RECOVERY_FROM}" \
           --to "$${RECOVERY_TO}" \
+          --main-bot-username "$${RECOVERY_MAIN_BOT_USERNAME}" \
+          --chunk-size "$${RECOVERY_CHUNK_SIZE}" \
           --output "/reports/$${RECOVERY_REPORT_FILE}" \
-          --takeout
+          --takeout \
+          "$${@}"
 
-  recovery-audit-postgresql:
+  recovery-repair-postgresql:
     profiles: [recovery]
     build: *recovery-build
     environment:
-      <<: *owner-environment
-      RECOVERY_FROM: ${RECOVERY_FROM:-}
-      RECOVERY_TO: ${RECOVERY_TO:-}
-      RECOVERY_REPORT_DIR: ${RECOVERY_REPORT_DIR:-}
-      RECOVERY_REPORT_FILE: ${RECOVERY_REPORT_FILE:-}
+      <<: *repair-environment
       RECOVERY_ETM_POSTGRES_URL: ${RECOVERY_ETM_POSTGRES_URL:-}
     volumes:
       - recovery_owner_data:/var/lib/tg-search
@@ -101,19 +114,30 @@ services:
         : "$${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH}"
         : "$${RECOVERY_FROM:?Set RECOVERY_FROM to a timezone-aware ISO 8601 timestamp}"
         : "$${RECOVERY_TO:?Set RECOVERY_TO to a timezone-aware ISO 8601 timestamp}"
+        : "$${RECOVERY_MAIN_BOT_USERNAME:?Set RECOVERY_MAIN_BOT_USERNAME to the ETM main bot username}"
+        : "$${RECOVERY_CHUNK_SIZE:?Set RECOVERY_CHUNK_SIZE to a positive integer}"
         : "$${RECOVERY_REPORT_DIR:?Set RECOVERY_REPORT_DIR to an existing report directory}"
         : "$${RECOVERY_REPORT_FILE:?Set RECOVERY_REPORT_FILE to a report filename}"
         : "$${RECOVERY_ETM_POSTGRES_URL:?Set RECOVERY_ETM_POSTGRES_URL to the ETM PostgreSQL DSN}"
         case "$${RECOVERY_REPORT_FILE}" in
-          */*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
+          .|..|*/*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
         esac
-        exec tg-search recovery audit \
+        set --
+        while IFS= read -r bot_username; do
+          [ -z "$${bot_username}" ] || set -- "$${@}" --aux-bot-username "$${bot_username}"
+        done <<AUX_BOT_USERNAMES
+        $${RECOVERY_AUX_BOT_USERNAMES}
+        AUX_BOT_USERNAMES
+        exec tg-search recovery repair \
           --profile "$${RECOVERY_PROFILE}" \
           --etm-postgres-url "$${RECOVERY_ETM_POSTGRES_URL}" \
           --from "$${RECOVERY_FROM}" \
           --to "$${RECOVERY_TO}" \
+          --main-bot-username "$${RECOVERY_MAIN_BOT_USERNAME}" \
+          --chunk-size "$${RECOVERY_CHUNK_SIZE}" \
           --output "/reports/$${RECOVERY_REPORT_FILE}" \
-          --takeout
+          --takeout \
+          "$${@}"
 
 volumes:
   recovery_owner_data:

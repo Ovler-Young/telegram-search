@@ -49,6 +49,25 @@ function stringArgs(value: string | boolean | string[] | undefined): string[] {
   return Array.isArray(value) ? value : []
 }
 
+const RECOVERY_BOT_USERNAME = /^[a-z]\w{1,28}bot$/i
+
+export function normalizeRecoveryBotUsernames(main: string, auxiliary: string[]): { main: string, auxiliary: string[] } {
+  const normalize = (value: string) => value.trim().replace(/^@/, '').toLowerCase()
+  const normalizedMain = normalize(main)
+  const normalizedAuxiliary = auxiliary.map(normalize)
+  for (const username of [normalizedMain, ...normalizedAuxiliary]) {
+    if (!RECOVERY_BOT_USERNAME.test(username))
+      throw new Error(`Invalid Telegram bot username: ${username || '<empty>'}`)
+  }
+  const seen = new Set([normalizedMain])
+  for (const username of normalizedAuxiliary) {
+    if (seen.has(username))
+      throw new Error(`Duplicate Telegram bot username: ${username}`)
+    seen.add(username)
+  }
+  return { main: normalizedMain, auxiliary: normalizedAuxiliary }
+}
+
 function parseTimestamp(value: string | undefined): number | undefined {
   if (!value)
     return undefined
@@ -580,13 +599,17 @@ const recoveryCommand = defineCommand({
         if (!Number.isInteger(chunkSize) || chunkSize <= 0)
           throw new Error('Recovery repair requires --chunk-size to be a positive integer')
         const output = stringArg(context.args.output)
+        const botUsernames = normalizeRecoveryBotUsernames(
+          stringArg(context.args['main-bot-username']),
+          stringArgs(context.args['aux-bot-username']),
+        )
         await withRuntime(profile, true, async (runtime) => {
           await emitStreamResult(runtime.streams.recoveryRepair({
             etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
             fromMs,
             toMs,
-            mainBotUsername: stringArg(context.args['main-bot-username']),
-            auxiliaryBotUsernames: stringArgs(context.args['aux-bot-username']),
+            mainBotUsername: botUsernames.main,
+            auxiliaryBotUsernames: botUsernames.auxiliary,
             chunkSize,
             outputFile: output ? resolve(output) : null,
             takeout: context.args.takeout === true,

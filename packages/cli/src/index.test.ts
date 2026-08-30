@@ -10,6 +10,7 @@ import {
   emitResult,
   emitStreamResult,
   normalizeRawArgs,
+  normalizeRecoveryBotUsernames,
   parseRecoveryEtmSource,
   parseRecoveryTimestamp,
   resolveExportOutputPath,
@@ -38,6 +39,15 @@ function captureOutput() {
 }
 
 describe('cLI command boundary', () => {
+  it('normalizes and validates recovery bot usernames before opening the runtime', () => {
+    expect(normalizeRecoveryBotUsernames(' @Main_Bot ', ['AuxOneBot', '@aux_two_bot'])).toEqual({
+      main: 'main_bot',
+      auxiliary: ['auxonebot', 'aux_two_bot'],
+    })
+    expect(() => normalizeRecoveryBotUsernames('not-a-bot', [])).toThrow('Invalid Telegram bot username')
+    expect(() => normalizeRecoveryBotUsernames('MainBot', ['@mainbot'])).toThrow('Duplicate Telegram bot username')
+  })
+
   it('requires unambiguous timezone-aware recovery boundaries', () => {
     expect(parseRecoveryTimestamp('2026-01-01T00:00:00+08:00', '--from'))
       .toBe(Date.parse('2025-12-31T16:00:00Z'))
@@ -45,7 +55,7 @@ describe('cLI command boundary', () => {
     expect(() => parseRecoveryTimestamp('2026-02-30T00:00:00Z', '--to')).toThrow('Invalid timestamp')
   })
 
-  it('requires exactly one read-only ETM database source', () => {
+  it('requires exactly one ETM database source', () => {
     const sqlitePath = resolve(process.cwd(), 'test-etm.db')
     expect(parseRecoveryEtmSource(sqlitePath, '')).toEqual({ backend: 'sqlite', path: sqlitePath })
     expect(parseRecoveryEtmSource('', 'postgresql://localhost/etm')).toEqual({
