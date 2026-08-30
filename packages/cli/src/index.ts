@@ -4,7 +4,6 @@ import type { OutputMeta } from './output'
 
 import process from 'node:process'
 
-import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
@@ -61,25 +60,6 @@ function parseChatIds(value: string | undefined): string[] | undefined {
   return ids?.length ? ids : undefined
 }
 
-export function parseRecoveryChatFile(content: string): string[] {
-  const chatIds = new Map<string, true>()
-  for (const [index, sourceLine] of content.split(/\r?\n/).entries()) {
-    const commentIndex = sourceLine.indexOf('#')
-    const value = (commentIndex === -1 ? sourceLine : sourceLine.slice(0, commentIndex)).trim()
-    if (!value)
-      continue
-    if (!/^-?\d+$/.test(value))
-      throw new Error(`Invalid Telegram chat ID on line ${index + 1}: ${value}`)
-    const canonical = BigInt(value).toString()
-    if (canonical === '0')
-      throw new Error(`Telegram chat ID on line ${index + 1} must not be zero`)
-    chatIds.set(canonical, true)
-  }
-  if (chatIds.size === 0)
-    throw new Error('Chat file does not contain any Telegram chat IDs')
-  return [...chatIds.keys()]
-}
-
 const RECOVERY_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|([+-])(\d{2}):(\d{2}))$/
 
 export function parseRecoveryTimestamp(value: string, option: '--from' | '--to'): number {
@@ -115,6 +95,14 @@ export function parseRecoveryTimestamp(value: string, option: '--from' | '--to')
     throw new Error(`Invalid timestamp for ${option}: ${value}`)
   }
   return parsed
+}
+
+export function parseRecoveryEtmSource(sqlitePath: string, postgresUrl: string) {
+  if (Boolean(sqlitePath) === Boolean(postgresUrl))
+    throw new Error('Recovery audit requires exactly one of --etm-sqlite or --etm-postgres-url')
+  return sqlitePath
+    ? { backend: 'sqlite' as const, path: resolve(sqlitePath) }
+    : { backend: 'postgres' as const, url: postgresUrl }
 }
 
 export function resolveExportOutputPath(output: string | undefined, defaultPath: string): string {
@@ -558,12 +546,13 @@ const exportCommand = defineCommand({
 })
 
 const recoveryCommand = defineCommand({
-  meta: { name: 'recovery', description: 'Export bounded owner-account Telegram history for recovery' },
+  meta: { name: 'recovery', description: 'Audit bounded owner-account history against ETM MsgLog' },
   subCommands: {
-    export: defineCommand({
-      meta: { name: 'export', description: 'Export selected group messages to versioned recovery JSONL' },
+    audit: defineCommand({
+      meta: { name: 'audit', description: 'Write a read-only diagnostic comparison against ETM' },
       args: {
-        'chat-file': { type: 'string', required: true },
+        'etm-sqlite': { type: 'string' },
+        'etm-postgres-url': { type: 'string' },
         'from': { type: 'string', required: true },
         'to': { type: 'string', required: true },
         'output': { type: 'string', required: true },
@@ -575,14 +564,13 @@ const recoveryCommand = defineCommand({
         const fromMs = parseRecoveryTimestamp(stringArg(context.args.from), '--from')
         const toMs = parseRecoveryTimestamp(stringArg(context.args.to), '--to')
         if (fromMs >= toMs)
-          throw new Error('Recovery export requires --from to be earlier than --to')
-        const chatFile = resolve(stringArg(context.args['chat-file']))
-        const topicChatIds = parseRecoveryChatFile(await readFile(chatFile, 'utf8'))
+          throw new Error('Recovery audit requires --from to be earlier than --to')
+        const sqlitePath = stringArg(context.args['etm-sqlite'])
+        const postgresUrl = stringArg(context.args['etm-postgres-url'])
         const outputFile = resolve(stringArg(context.args.output))
         await withRuntime(profile, true, async (runtime) => {
-          await emitStreamResult(runtime.streams.recoveryExport({
-            profile,
-            topicChatIds,
+          await emitStreamResult(runtime.streams.recoveryAudit({
+            etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
             fromMs,
             toMs,
             outputFile,

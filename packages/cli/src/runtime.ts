@@ -147,7 +147,7 @@ export async function createCliRuntime(paths: ProfilePaths, options: { remote: b
     streams: {
       sync: defineStreamInvoke(eventContext, syncContracts.run),
       export: defineStreamInvoke(eventContext, exportContracts.run),
-      recoveryExport: defineStreamInvoke(eventContext, recoveryContracts.export),
+      recoveryAudit: defineStreamInvoke(eventContext, recoveryContracts.audit),
     },
     close: async () => {
       unregister()

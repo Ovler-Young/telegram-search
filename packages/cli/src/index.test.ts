@@ -10,7 +10,7 @@ import {
   emitResult,
   emitStreamResult,
   normalizeRawArgs,
-  parseRecoveryChatFile,
+  parseRecoveryEtmSource,
   parseRecoveryTimestamp,
   resolveExportOutputPath,
   runCli,
@@ -38,24 +38,22 @@ function captureOutput() {
 }
 
 describe('cLI command boundary', () => {
-  it('parses a mounted chat file in deterministic first-seen order', () => {
-    expect(parseRecoveryChatFile(`
-      # ETM groups
-      -10012345678901234567890
-      -42 # basic group
-      -10012345678901234567890
-      -00042
-    `)).toEqual(['-10012345678901234567890', '-42'])
-
-    expect(() => parseRecoveryChatFile('group-one')).toThrow('line 1')
-    expect(() => parseRecoveryChatFile('# none')).toThrow('does not contain')
-  })
-
   it('requires unambiguous timezone-aware recovery boundaries', () => {
     expect(parseRecoveryTimestamp('2026-01-01T00:00:00+08:00', '--from'))
       .toBe(Date.parse('2025-12-31T16:00:00Z'))
     expect(() => parseRecoveryTimestamp('2026-01-01T00:00:00', '--from')).toThrow('explicit timezone')
     expect(() => parseRecoveryTimestamp('2026-02-30T00:00:00Z', '--to')).toThrow('Invalid timestamp')
+  })
+
+  it('requires exactly one read-only ETM database source', () => {
+    const sqlitePath = resolve(process.cwd(), 'test-etm.db')
+    expect(parseRecoveryEtmSource(sqlitePath, '')).toEqual({ backend: 'sqlite', path: sqlitePath })
+    expect(parseRecoveryEtmSource('', 'postgresql://localhost/etm')).toEqual({
+      backend: 'postgres',
+      url: 'postgresql://localhost/etm',
+    })
+    expect(() => parseRecoveryEtmSource('', '')).toThrow('exactly one')
+    expect(() => parseRecoveryEtmSource(sqlitePath, 'postgresql://localhost/etm')).toThrow('exactly one')
   })
 
   it('resolves explicit export paths in the invoking process', () => {
