@@ -9,6 +9,7 @@ import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 
 import { retryTelegramResult, toAppError } from '@tg-search/core'
+import { createRecoveryInputAuthority, readEtmRecoveryConfig } from '@tg-search/core/recovery-config'
 import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { defineCommand, runMain } from 'citty'
 import { TelegramClient } from 'telegram'
@@ -59,14 +60,6 @@ function parseTimestamp(value: string | undefined): number | undefined {
 function parseChatIds(value: string | undefined): string[] | undefined {
   const ids = value?.split(',').map(item => item.trim()).filter(Boolean)
   return ids?.length ? ids : undefined
-}
-
-export function parseRecoveryEtmSource(sqlitePath: string, postgresUrl: string) {
-  if (Boolean(sqlitePath) === Boolean(postgresUrl))
-    throw new Error('Recovery repair requires exactly one of --etm-sqlite or --etm-postgres-url')
-  return sqlitePath
-    ? { backend: 'sqlite' as const, path: resolve(sqlitePath) }
-    : { backend: 'postgres' as const, url: postgresUrl }
 }
 
 export function resolveExportOutputPath(output: string | undefined, defaultPath: string): string {
@@ -515,8 +508,8 @@ const recoveryCommand = defineCommand({
     repair: defineCommand({
       meta: { name: 'repair', description: 'Insert verified bot history missing from ETM MsgLog' },
       args: {
+        'etm-config': { type: 'string', required: true },
         'etm-sqlite': { type: 'string' },
-        'etm-postgres-url': { type: 'string' },
         'chunk-size': { type: 'string', default: '250' },
         'output': { type: 'string' },
         'takeout': { type: 'boolean', default: false },
@@ -527,15 +520,21 @@ const recoveryCommand = defineCommand({
         if (!Number.isFinite(startedAtMs) || startedAtMs <= Date.parse(RECOVERY_REPAIR_FROM_ISO))
           throw new Error(`Recovery repair clock must be later than ${RECOVERY_REPAIR_FROM_ISO}`)
         const profile = profileFrom(context)
+        const configPath = stringArg(context.args['etm-config'])
+        if (!configPath)
+          throw new Error('Recovery repair requires --etm-config')
         const sqlitePath = stringArg(context.args['etm-sqlite'])
-        const postgresUrl = stringArg(context.args['etm-postgres-url'])
         const chunkSize = Number(stringArg(context.args['chunk-size']))
         if (!Number.isInteger(chunkSize) || chunkSize <= 0)
           throw new Error('Recovery repair requires --chunk-size to be a positive integer')
         const output = stringArg(context.args.output)
+        const authority = createRecoveryInputAuthority(
+          await readEtmRecoveryConfig(resolve(configPath)),
+          sqlitePath ? resolve(sqlitePath) : '',
+        )
         await withRuntime(profile, true, async (runtime) => {
           await emitStreamResult(runtime.streams.recoveryRepair({
-            etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
+            ...authority,
             startedAtMs,
             chunkSize,
             outputFile: output ? resolve(output) : null,
