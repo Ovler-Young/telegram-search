@@ -9,6 +9,7 @@ import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 
 import { retryTelegramResult, toAppError } from '@tg-search/core'
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { defineCommand, runMain } from 'citty'
 import { TelegramClient } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
@@ -60,46 +61,9 @@ function parseChatIds(value: string | undefined): string[] | undefined {
   return ids?.length ? ids : undefined
 }
 
-const RECOVERY_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|([+-])(\d{2}):(\d{2}))$/
-
-export function parseRecoveryTimestamp(value: string, option: '--from' | '--to'): number {
-  const match = RECOVERY_TIMESTAMP.exec(value)
-  if (!match)
-    throw new Error(`${option} requires an ISO 8601 timestamp with an explicit timezone offset`)
-
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0', fractionText = '', zone, sign, offsetHourText = '0', offsetMinuteText = '0'] = match
-  const year = Number(yearText)
-  const month = Number(monthText)
-  const day = Number(dayText)
-  const hour = Number(hourText)
-  const minute = Number(minuteText)
-  const second = Number(secondText)
-  const millisecond = Number(fractionText.padEnd(3, '0'))
-  const offsetHour = Number(offsetHourText)
-  const offsetMinute = Number(offsetMinuteText)
-  if (offsetHour > 23 || offsetMinute > 59)
-    throw new Error(`Invalid timestamp for ${option}: ${value}`)
-  const offset = zone === 'Z' ? 0 : (sign === '-' ? -1 : 1) * (offsetHour * 60 + offsetMinute)
-  const localMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond)
-  const parsed = localMs - offset * 60_000
-  const normalized = new Date(parsed + offset * 60_000)
-  if (
-    normalized.getUTCFullYear() !== year
-    || normalized.getUTCMonth() !== month - 1
-    || normalized.getUTCDate() !== day
-    || normalized.getUTCHours() !== hour
-    || normalized.getUTCMinutes() !== minute
-    || normalized.getUTCSeconds() !== second
-    || normalized.getUTCMilliseconds() !== millisecond
-  ) {
-    throw new Error(`Invalid timestamp for ${option}: ${value}`)
-  }
-  return parsed
-}
-
 export function parseRecoveryEtmSource(sqlitePath: string, postgresUrl: string) {
   if (Boolean(sqlitePath) === Boolean(postgresUrl))
-    throw new Error('Recovery audit requires exactly one of --etm-sqlite or --etm-postgres-url')
+    throw new Error('Recovery repair requires exactly one of --etm-sqlite or --etm-postgres-url')
   return sqlitePath
     ? { backend: 'sqlite' as const, path: resolve(sqlitePath) }
     : { backend: 'postgres' as const, url: postgresUrl }
@@ -546,34 +510,35 @@ const exportCommand = defineCommand({
 })
 
 const recoveryCommand = defineCommand({
-  meta: { name: 'recovery', description: 'Audit bounded owner-account history against ETM MsgLog' },
+  meta: { name: 'recovery', description: 'Repair bounded ETM MsgLog gaps from owner-account history' },
   subCommands: {
-    audit: defineCommand({
-      meta: { name: 'audit', description: 'Write a read-only diagnostic comparison against ETM' },
+    repair: defineCommand({
+      meta: { name: 'repair', description: 'Insert verified bot history missing from ETM MsgLog' },
       args: {
         'etm-sqlite': { type: 'string' },
         'etm-postgres-url': { type: 'string' },
-        'from': { type: 'string', required: true },
-        'to': { type: 'string', required: true },
-        'output': { type: 'string', required: true },
+        'chunk-size': { type: 'string', default: '250' },
+        'output': { type: 'string' },
         'takeout': { type: 'boolean', default: false },
         ...profileArg,
       },
       async run(context) {
+        const startedAtMs = Date.now()
+        if (!Number.isFinite(startedAtMs) || startedAtMs <= Date.parse(RECOVERY_REPAIR_FROM_ISO))
+          throw new Error(`Recovery repair clock must be later than ${RECOVERY_REPAIR_FROM_ISO}`)
         const profile = profileFrom(context)
-        const fromMs = parseRecoveryTimestamp(stringArg(context.args.from), '--from')
-        const toMs = parseRecoveryTimestamp(stringArg(context.args.to), '--to')
-        if (fromMs >= toMs)
-          throw new Error('Recovery audit requires --from to be earlier than --to')
         const sqlitePath = stringArg(context.args['etm-sqlite'])
         const postgresUrl = stringArg(context.args['etm-postgres-url'])
-        const outputFile = resolve(stringArg(context.args.output))
+        const chunkSize = Number(stringArg(context.args['chunk-size']))
+        if (!Number.isInteger(chunkSize) || chunkSize <= 0)
+          throw new Error('Recovery repair requires --chunk-size to be a positive integer')
+        const output = stringArg(context.args.output)
         await withRuntime(profile, true, async (runtime) => {
-          await emitStreamResult(runtime.streams.recoveryAudit({
+          await emitStreamResult(runtime.streams.recoveryRepair({
             etm: parseRecoveryEtmSource(sqlitePath, postgresUrl),
-            fromMs,
-            toMs,
-            outputFile,
+            startedAtMs,
+            chunkSize,
+            outputFile: output ? resolve(output) : null,
             takeout: context.args.takeout === true,
           }), outputMeta(profile, 'telegram'))
         })

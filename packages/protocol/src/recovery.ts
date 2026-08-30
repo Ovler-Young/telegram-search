@@ -3,27 +3,53 @@ import type { InferOutput } from 'valibot'
 import type { AppError } from './errors'
 
 import { defineInvokeEventa } from '@moeru/eventa'
-import { boolean, literal, minLength, number, object, pipe, string, union } from 'valibot'
+import { boolean, literal, minLength, nullable, number, object, optional, pipe, string, union } from 'valibot'
 
-export const recoveryAuditInputSchema = object({
+export const RECOVERY_REPAIR_FROM_ISO = '2026-07-13T18:22:03Z'
+
+export const recoveryRepairInputSchema = object({
   etm: union([
     object({ backend: literal('sqlite'), path: pipe(string(), minLength(1)) }),
     object({ backend: literal('postgres'), url: pipe(string(), minLength(1)) }),
   ]),
-  fromMs: number(),
-  toMs: number(),
-  outputFile: pipe(string(), minLength(1)),
+  startedAtMs: number(),
+  chunkSize: number(),
+  outputFile: optional(nullable(pipe(string(), minLength(1)))),
   takeout: boolean(),
 })
 
-export type RecoveryAuditInput = InferOutput<typeof recoveryAuditInputSchema>
+export type RecoveryRepairInput = InferOutput<typeof recoveryRepairInputSchema>
 
-export type RecoveryAuditUpdate
+export interface RecoveryRepairCounts {
+  'present-primary': number
+  'present-alt': number
+  'inserted': number
+  'unbound-topic': number
+  'human-or-unverified-sender': number
+  'unclassified-verified-bot': number
+  'service-deleted-unusable': number
+  'concurrent': number
+  'conflicts': number
+  'errors': number
+}
+
+export interface RecoveryRepairSummary {
+  version: 1
+  backend: 'sqlite' | 'postgres'
+  window: { from: string, to: string, semantics: '[from,to)' }
+  groups: string[]
+  mainBotIds: string[]
+  auxiliaryBotIds: string[]
+  counts: RecoveryRepairCounts
+  examined: number
+}
+
+export type RecoveryRepairUpdate
   = | { type: 'started', taskId: string }
-    | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, audited: number }
-    | { type: 'completed', taskId: string, file: string, audited: number }
+    | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, examined: number }
+    | { type: 'completed', summary: RecoveryRepairSummary, file: string | null }
     | { type: 'failed', taskId: string, error: AppError }
 
 export const recoveryContracts = {
-  audit: defineInvokeEventa<RecoveryAuditUpdate, RecoveryAuditInput>('tg.v1.recovery.audit'),
+  repair: defineInvokeEventa<RecoveryRepairUpdate, RecoveryRepairInput>('tg.v1.recovery.repair'),
 }
