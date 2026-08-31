@@ -4,9 +4,11 @@ import type { OutputMeta } from './output'
 
 import process from 'node:process'
 
+import { realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
+import { fileURLToPath } from 'node:url'
 
 import { retryTelegramResult, toAppError } from '@tg-search/core'
 import { createRecoveryInputAuthority, readEtmRecoveryConfig } from '@tg-search/core/recovery-config'
@@ -611,7 +613,19 @@ export async function runCli(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export function isCliEntrypoint(moduleUrl: string, entryPath = process.argv[1]): boolean {
+  if (!entryPath)
+    return false
+
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(entryPath)
+  }
+  catch {
+    return false
+  }
+}
+
+if (isCliEntrypoint(import.meta.url)) {
   runCli().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
