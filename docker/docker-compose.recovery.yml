@@ -27,6 +27,14 @@ x-etm-config: &etm-config
   bind:
     create_host_path: false
 
+x-etm-profile-directory: &etm-profile-directory
+  type: bind
+  source: ${RECOVERY_ETM_PROFILE_DIR:-/dev/null}
+  target: /run/etm-profile
+  read_only: false
+  bind:
+    create_host_path: false
+
 x-repair-environment: &repair-environment
   <<: *owner-environment
   RECOVERY_CHUNK_SIZE: ${RECOVERY_CHUNK_SIZE:-250}
@@ -59,13 +67,7 @@ services:
     volumes:
       - recovery_owner_data:/var/lib/tg-search
       - *report-directory
-      - *etm-config
-      - type: bind
-        source: ${RECOVERY_ETM_SQLITE_DB_FILE:-/dev/null}
-        target: /etm/tgdata.db
-        read_only: false
-        bind:
-          create_host_path: false
+      - *etm-profile-directory
     command:
       - /bin/sh
       - -eu
@@ -76,15 +78,15 @@ services:
         : "$${RECOVERY_CHUNK_SIZE:?Set RECOVERY_CHUNK_SIZE to a positive integer}"
         : "$${RECOVERY_REPORT_DIR:?Set RECOVERY_REPORT_DIR to an existing report directory}"
         : "$${RECOVERY_REPORT_FILE:?Set RECOVERY_REPORT_FILE to a report filename}"
-        test -f /run/etm/config.yaml || { echo 'Set RECOVERY_ETM_CONFIG_FILE to the ETM configuration file' >&2; exit 2; }
-        test -f /etm/tgdata.db || { echo 'Set RECOVERY_ETM_SQLITE_DB_FILE to the ETM SQLite database' >&2; exit 2; }
+        test -f /run/etm-profile/config.yaml || { echo 'RECOVERY_ETM_PROFILE_DIR must contain config.yaml' >&2; exit 2; }
+        test -f /run/etm-profile/tgdata.db || { echo 'RECOVERY_ETM_PROFILE_DIR must contain tgdata.db' >&2; exit 2; }
         case "$${RECOVERY_REPORT_FILE}" in
           .|..|*/*) echo 'RECOVERY_REPORT_FILE must be a filename within RECOVERY_REPORT_DIR' >&2; exit 2 ;;
         esac
         exec tg-search recovery repair \
           --profile "$${RECOVERY_PROFILE}" \
-          --etm-config /run/etm/config.yaml \
-          --etm-sqlite /etm/tgdata.db \
+          --etm-config /run/etm-profile/config.yaml \
+          --etm-sqlite /run/etm-profile/tgdata.db \
           --chunk-size "$${RECOVERY_CHUNK_SIZE}" \
           --output "/reports/$${RECOVERY_REPORT_FILE}" \
           --takeout

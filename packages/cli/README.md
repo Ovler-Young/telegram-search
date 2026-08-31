@@ -86,72 +86,183 @@ tg-search --profile work messages list --chat 123456 --sender me --to 2026-01-31
 
 The recovery Compose profile provides explicit, run-once jobs for owner-account authentication and best-effort repair of ETM `MsgLog` gaps. ETM's existing `TopicAssoc` rows select the Telegram groups and topics to inspect. The repair scans owner-account history in the built-in interval `[2026-07-13T18:22:03Z, command-start-time)`, checks both `master_msg_id` and `master_msg_id_alt`, and inserts missing synthetic rows directly into the database selected by the ETM configuration.
 
-Create a private report directory. `RECOVERY_REPORT_FILE` must be a filename within `RECOVERY_REPORT_DIR`.
+### Prerequisites
+
+The host needs Git, a running Docker Engine, and the Docker Compose plugin. Compose must support profiles, build targets, named volumes, interactive `stdin_open`/`tty`, and long bind syntax with `bind.create_host_path: false`; this runbook does not claim a minimum version. The host also needs outbound access to GitHub, the container registry, and Telegram. Have the owner account's phone number, a logged-in Telegram mobile device that can receive the login code and authorize Takeout, and Telegram API ID/hash credentials available.
+
+For SQLite, the existing ETM channel profile directory must contain both `config.yaml` and `tgdata.db`. The examples use `/root/.ehforwarderbot/profiles/default/blueset.telegram`. For PostgreSQL, its ETM `config.yaml` must be available as a private host file and must contain connection settings reachable from the recovery container.
+
+There is no `platform` pin in the recovery Compose file. The recovery target uses the official `node:24.13.0-bookworm-slim` base, which is expected to publish a multi-architecture manifest that lets Docker select the native host image. The lockfile includes Linux ARM64 native dependencies such as `@node-rs/jieba-linux-arm64-gnu`. These are supporting inputs rather than a runtime certification: the recovery image target has not been executed in CI on ARM64, so build and run it on the target host before relying on it.
+
+### Prepare the checkout and private runtime settings
+
+Create a private working directory, clone the owner fork, select `main`, and verify that the checkout is exactly the current fetched `origin/main`:
 
 ```bash
-mkdir -p "$PWD/recovery-reports"
-chmod 700 "$PWD/recovery-reports"
-
-export RECOVERY_PROFILE=recovery
-export RECOVERY_REPORT_DIR="$PWD/recovery-reports"
-export RECOVERY_REPORT_FILE=etm-repair.jsonl
-export RECOVERY_CHUNK_SIZE=250
-export RECOVERY_ETM_CONFIG_FILE='/absolute/path/to/etm-config.yaml'
-export TELEGRAM_API_ID='<telegram-api-id>'
-export TELEGRAM_API_HASH='<telegram-api-hash>'
+install -d -m 700 /root/telegram-search-recovery
+cd /root/telegram-search-recovery
+git clone https://github.com/Ovler-Young/telegram-search.git
+cd telegram-search
+git fetch origin main
+git checkout main
+git pull --ff-only origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+git rev-parse HEAD
 ```
 
-Build and authenticate interactively. The named `recovery_owner_data` volume retains the owner profile and Telegram StringSession between commands; neither is copied into the image.
+Keep secrets out of shell history and repository files. Read Telegram credentials interactively into the current shell, then create a private report directory. `RECOVERY_REPORT_FILE` must be a filename within `RECOVERY_REPORT_DIR`.
+
+```bash
+umask 077
+read -r -p 'Telegram API ID: ' TELEGRAM_API_ID
+read -r -s -p 'Telegram API hash: ' TELEGRAM_API_HASH
+printf '\n' >&2
+export TELEGRAM_API_ID TELEGRAM_API_HASH
+
+export RECOVERY_PROFILE=recovery
+export RECOVERY_REPORT_DIR=/root/telegram-search-recovery/reports
+export RECOVERY_REPORT_FILE=etm-repair.jsonl
+export RECOVERY_CHUNK_SIZE=250
+install -d -m 700 "$RECOVERY_REPORT_DIR"
+```
+
+For SQLite, export the whole ETM channel profile directory, not an individual database-file path:
+
+```bash
+export RECOVERY_ETM_PROFILE_DIR=/root/.ehforwarderbot/profiles/default/blueset.telegram
+test -f "$RECOVERY_ETM_PROFILE_DIR/config.yaml"
+test -f "$RECOVERY_ETM_PROFILE_DIR/tgdata.db"
+```
+
+For PostgreSQL, instead read the private configuration path interactively so its location need not be stored in shell history:
+
+```bash
+read -r -p 'Absolute path to PostgreSQL ETM config.yaml: ' RECOVERY_ETM_CONFIG_FILE
+export RECOVERY_ETM_CONFIG_FILE
+test -f "$RECOVERY_ETM_CONFIG_FILE"
+```
+
+### Build and authenticate
+
+Build and authenticate from the repository root:
 
 ```bash
 docker compose -f docker/docker-compose.recovery.yml --profile recovery build
 docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-auth
 ```
 
-The authentication service runs `tg-search --profile recovery auth login` when `RECOVERY_PROFILE=recovery`.
+Compose allocates a TTY and keeps stdin open. The authentication job runs `tg-search --profile recovery auth login`, prompts for the owner phone number, and then asks for the code delivered to the currently logged-in Telegram mobile app. The code prompt is masked. If the account has cloud-password 2FA enabled, the subsequent `2FA password` prompt is also masked. This command has no QR login path; the mobile-device action is to read the login code, not scan a QR code.
 
-For SQLite, the ETM configuration must select SQLite. Provide the existing ETM database file separately. Compose mounts the configuration read-only at `/run/etm/config.yaml`, the database read-write at `/etm/tgdata.db`, and the report directory read-write.
+Successful login writes one JSON envelope to stdout with `ok: true`, the profile, Telegram user ID, optional username, and `meta.source: "telegram"`. A failed login writes an `ok: false` envelope containing a structured error, exits non-zero, and may write prompts or diagnostics to stderr. Do not paste login codes, the API hash, or a 2FA password into logs or reports.
 
-```bash
-export RECOVERY_ETM_SQLITE_DB_FILE='/absolute/path/to/tgdata.db'
-docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-repair-sqlite
+```json
+{"ok":true,"data":{"profile":"recovery","userId":"<telegram-user-id>","username":"<username>"},"meta":{"profile":"recovery","source":"telegram"}}
+{"ok":false,"error":{"code":"<error-code>","message":"<error-message>","retryable":false},"meta":{"profile":"recovery","source":"telegram"}}
 ```
 
-For PostgreSQL, the mounted ETM configuration must set `database.type: postgresql`. The job mounts no database file; all connection settings, including the password, come from the read-only configuration mount.
+The Compose project name is `telegram-search-recovery`. Its named volume `telegram-search-recovery_recovery_owner_data` is mounted at `/var/lib/tg-search`; for the default `RECOVERY_PROFILE=recovery`, the persisted StringSession is `/var/lib/tg-search/profiles/recovery/session` inside that volume. Subsequent repair jobs reuse it. The session is not copied into the image.
+
+### Optional online SQLite backup
+
+An ETM process may remain online while SQLite creates a consistent backup from the live WAL database. Use SQLite's backup API rather than copying database files. This optional step deliberately fails if the `sqlite3` CLI is unavailable; install it or consciously proceed without a backup.
 
 ```bash
-docker compose -f docker/docker-compose.recovery.yml --profile recovery run --rm recovery-repair-postgresql
+command -v sqlite3 >/dev/null 2>&1 || {
+  echo 'sqlite3 is required for the optional online backup' >&2
+  exit 1
+}
+install -d -m 700 /root/telegram-search-recovery/backups
+RECOVERY_BACKUP_FILE=/root/telegram-search-recovery/backups/tgdata-before-repair.db
+sqlite3 "$RECOVERY_ETM_PROFILE_DIR/tgdata.db" ".backup '$RECOVERY_BACKUP_FILE'"
+chmod 600 "$RECOVERY_BACKUP_FILE"
 ```
 
-Both repair jobs run the following bounded command with the selected database option and fixed container paths.
+### Run SQLite repair
+
+The SQLite job mounts `${RECOVERY_ETM_PROFILE_DIR}` read-write at `/run/etm-profile`, verifies `config.yaml` and `tgdata.db`, and passes those exact two paths to the application. Mounting the directory gives SQLite one filesystem view of `tgdata.db`, `tgdata.db-wal`, and `tgdata.db-shm`, so the live ETM process and recovery process participate in SQLite's normal WAL visibility and file locking. The application explicitly reads only `config.yaml` and `tgdata.db`; SQLite itself creates, reads, or updates its sidecars as required. Compose performs no file copy, backup, or directory scan.
+
+```bash
+docker compose -f docker/docker-compose.recovery.yml --profile recovery run \
+  --name telegram-search-recovery-repair-sqlite \
+  recovery-repair-sqlite
+```
+
+The container runs this bounded command:
 
 ```bash
 tg-search recovery repair \
   --profile recovery \
-  --etm-config /run/etm/config.yaml \
-  --etm-sqlite /etm/tgdata.db \
+  --etm-config /run/etm-profile/config.yaml \
+  --etm-sqlite /run/etm-profile/tgdata.db \
   --chunk-size 250 \
   --output /reports/etm-repair.jsonl \
   --takeout
 ```
 
-The PostgreSQL job uses the same command without `--etm-sqlite`; the mounted configuration is its only database source. The CLI rejects a PostgreSQL configuration when `--etm-sqlite` is supplied and rejects a SQLite configuration when it is absent.
+### Run PostgreSQL repair
 
-`--takeout` requires owner approval. If Telegram requests a separate Takeout confirmation, approve it in Telegram and rerun the repair job; the job does not retry automatically.
+The PostgreSQL job requires `database.type: postgresql` in the mounted configuration. It mounts only `${RECOVERY_ETM_CONFIG_FILE}` read-only at `/run/etm/config.yaml`; it mounts no database file or SQLite profile directory. All PostgreSQL connection settings, including the password, remain in that private configuration file rather than container environment variables.
+
+```bash
+docker compose -f docker/docker-compose.recovery.yml --profile recovery run \
+  --name telegram-search-recovery-repair-postgresql \
+  recovery-repair-postgresql
+```
+
+The PostgreSQL container invokes the same `tg-search recovery repair` command with `--etm-config /run/etm/config.yaml` and without `--etm-sqlite`. The CLI rejects a PostgreSQL configuration when `--etm-sqlite` is supplied and rejects a SQLite configuration when it is absent.
+
+`--takeout` requires owner approval. If Telegram requests a separate Takeout confirmation, approve it in the current Telegram mobile app and rerun the repair job; the job does not retry automatically.
 
 The repair reads the main identity from `token` and auxiliary identities from each `auxiliary_bots[].token`. It extracts only the numeric bot ID before the colon and never includes a token in stdout or the report. Each configured identity must resolve through the owner account to the matching Telegram bot user before any database inspection or write occurs. Messages from humans, unconfigured senders, or identities that cannot be verified are counted as `human-or-unconfigured-sender` and are not inserted.
 
-The configuration also supplies `database.type`, `database`, `host`, `port`, `user`, `password`, `max_connections`, `stale_timeout`, and `options`. Unless `database.type` is exactly `postgresql`, the repair selects SQLite and requires the separately mounted database file. PostgreSQL uses ETM's defaults when fields are omitted: database `efb_telegram`, host `localhost`, port `5432`, user `postgres`, an empty password, `max_connections: 8`, `stale_timeout: 300`, and `options: -c timezone=UTC`. `max_connections` controls the connection pool and `options` is passed to PostgreSQL. `stale_timeout` is validated for compatibility with the ETM configuration but has no node-postgres mapping. SSL/TLS configuration fields are unsupported and make the command fail before database access.
+The configuration also supplies `database.type`, `database`, `host`, `port`, `user`, `password`, `max_connections`, `stale_timeout`, and `options`. Unless `database.type` is exactly `postgresql`, the repair selects SQLite and requires the mounted profile's database. PostgreSQL uses ETM's defaults when fields are omitted: database `efb_telegram`, host `localhost`, port `5432`, user `postgres`, an empty password, `max_connections: 8`, `stale_timeout: 300`, and `options: -c timezone=UTC`. `max_connections` controls the connection pool and `options` is passed to PostgreSQL. `stale_timeout` is validated for compatibility with the ETM configuration but has no node-postgres mapping. SSL/TLS configuration fields are unsupported and make the command fail before database access.
 
 Each inserted row uses `<ETM Bot API chat ID>.<Telegram message ID>` as `master_msg_id`, the `TopicAssoc.slave_uid` for the matched topic, `Text` message/media types, and `mtproto-backfill:<master_msg_id>` as its synthetic `slave_message_id`. A message from the configured main bot stores SQL `NULL` in `sender_bot_id`; a message from a configured auxiliary bot stores that bot's numeric Telegram user ID. Messages outside a bound topic, empty text, and unusable service/deleted messages are not inserted.
 
 The first JSONL row is a `repair-summary`; it records the effective `[from,to)` window and the configured numeric main and auxiliary IDs. Later `repair-message` rows identify candidates without copying message text. Candidate status is `present-primary`, `present-alt`, or `repair-attempted`. Use the summary counts for outcomes: `inserted` records committed rows; `present-primary` and `present-alt` were represented at the pre-write snapshot; `concurrent` appeared before the serialized insert; `conflicts` lost an insert conflict; and `errors` counts candidates in failed chunks. `unbound-topic`, `human-or-unconfigured-sender`, and `service-deleted-unusable` explain filtered history.
 
-Reruns are idempotent for rows already represented by either ETM master-ID column. SQLite uses short `BEGIN IMMEDIATE` chunks, while PostgreSQL uses short transactions with a table lock and `ON CONFLICT DO NOTHING`; concurrent ETM delivery is rechecked or recorded as a conflict instead of being overwritten. A failed chunk is counted in `errors` and later chunks continue.
+Reruns are idempotent for rows already represented by either ETM master-ID column. SQLite uses short `BEGIN IMMEDIATE` chunks, while PostgreSQL uses short transactions with a table lock and `ON CONFLICT DO NOTHING`; concurrent ETM delivery is rechecked or recorded as a conflict instead of being overwritten. A failed chunk is counted in `errors` and later chunks continue. To rerun SQLite after inspecting its first container, remove that stopped container and repeat the same named command:
+
+```bash
+docker rm telegram-search-recovery-repair-sqlite
+docker compose -f docker/docker-compose.recovery.yml --profile recovery run \
+  --name telegram-search-recovery-repair-sqlite \
+  recovery-repair-sqlite
+```
 
 Accepted limitation: the inserted `slave_message_id` and related slave fields are synthetic because Telegram history does not retain ETM's original slave-side identity or serialized message state. On an unchanged ETM installation, historical edit, quote, remove, and react operations cannot reliably target these repaired rows. The repair restores searchable `MsgLog` text and routing metadata on a best-effort basis; it does not reconstruct authoritative historical operation targets.
 
-Keep the Telegram API hash, ETM configuration, owner session volume, report, and SQLite database private. The ETM configuration and SQLite database must already exist on the host; Compose does not create missing host paths. The configuration is never copied into the image or exposed as container environment content, and commands do not echo its tokens or password. Telegram API credentials remain runtime environment values. Restrict host files and the report directory to the account performing the repair. Each service exits after its command; the Compose profile defines no restart policy or scheduler.
+### Inspect and clean up
+
+The repair writes progress to stderr and exactly one terminal JSON envelope to stdout. Success has `ok: true` and a `completed` payload; failure has `ok: false`, a structured `error`, and a non-zero exit. Inspect the retained named container and the private JSONL report without printing configuration or session data:
+
+```json
+{"ok":true,"data":{"type":"completed","summary":{"version":1,"backend":"sqlite","window":{"from":"2026-07-13T18:22:03Z","to":"<command-start-time>","semantics":"[from,to)"},"groups":[],"mainBotIds":["<bot-id>"],"auxiliaryBotIds":[],"counts":{"present-primary":0,"present-alt":0,"inserted":0,"unbound-topic":0,"human-or-unconfigured-sender":0,"service-deleted-unusable":0,"concurrent":0,"conflicts":0,"errors":0},"examined":0},"file":"etm-repair.jsonl"},"meta":{"profile":"recovery","source":"telegram"}}
+{"ok":false,"error":{"code":"<error-code>","message":"<error-message>","retryable":false},"meta":{"profile":"recovery","source":"telegram"}}
+```
+
+```bash
+docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' \
+  telegram-search-recovery-repair-sqlite
+docker logs telegram-search-recovery-repair-sqlite
+test "$(stat -c '%a' "$RECOVERY_REPORT_DIR/$RECOVERY_REPORT_FILE")" = 600
+wc -l "$RECOVERY_REPORT_DIR/$RECOVERY_REPORT_FILE"
+sed -n '1,20p' "$RECOVERY_REPORT_DIR/$RECOVERY_REPORT_FILE"
+```
+
+Use the PostgreSQL container name in those commands when that backend was selected. The first JSONL row is the summary described above; later rows contain identifiers and classifications, not message text or credentials. Treat the report as private nonetheless.
+
+Remove stopped one-run containers and the Compose network while retaining the authentication session volume for an idempotent rerun:
+
+```bash
+docker rm telegram-search-recovery-repair-sqlite
+docker compose -f docker/docker-compose.recovery.yml --profile recovery down
+unset TELEGRAM_API_HASH TELEGRAM_API_ID RECOVERY_ETM_CONFIG_FILE
+```
+
+Use the PostgreSQL container name instead when applicable. `docker compose down` does not remove the named session volume. Only when recovery is finished and another login would be acceptable, remove the session explicitly with `docker volume rm telegram-search-recovery_recovery_owner_data`.
+
+Keep the Telegram API hash, ETM configuration, owner session volume, report, backup, and SQLite profile directory private. Required bind sources must already exist; `create_host_path: false` prevents Compose from creating missing ones. Configuration is never copied into the image or exposed as container environment content, and commands do not echo its tokens or password. Telegram API credentials remain runtime environment values. Each service exits after its command; the Compose profile defines no restart policy or scheduler.
 
 ## Annual export
 
