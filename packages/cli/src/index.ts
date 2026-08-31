@@ -508,7 +508,7 @@ const recoveryCommand = defineCommand({
   meta: { name: 'recovery', description: 'Repair bounded ETM MsgLog gaps from owner-account history' },
   subCommands: {
     repair: defineCommand({
-      meta: { name: 'repair', description: 'Insert verified bot history missing from ETM MsgLog' },
+      meta: { name: 'repair', description: 'Insert verified bot text and metadata history without downloading media' },
       args: {
         'etm-config': { type: 'string', required: true },
         'etm-sqlite': { type: 'string' },

@@ -5,6 +5,7 @@ import type { TakeoutService } from '../takeout'
 
 import process from 'node:process'
 
+import { Buffer } from 'node:buffer'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -160,7 +161,7 @@ describe('bounded recovery repair', () => {
     expect(inspect).not.toHaveBeenCalled()
   })
 
-  it('inserts mapped main and auxiliary bot text, filters other records, and reruns idempotently', async () => {
+  it('inserts bot text and metadata without persisting media, filters other records, and reruns idempotently', async () => {
     const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
     const toMs = (fromSeconds + 200) * 1000
     const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
@@ -193,19 +194,29 @@ describe('bounded recovery repair', () => {
       }),
     }
     const context = { emitter: new EventEmitter(), getClient: () => client } as unknown as CoreContext
-    const message = (id: number, sender: number, text: string, top?: number, reply?: number) => new Api.Message({
+    const message = (id: number, sender: number, text: string, top?: number, reply?: number, media?: Api.TypeMessageMedia) => new Api.Message({
       id,
       peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
       fromId: new Api.PeerUser({ userId: bigInt(sender) }),
       date: id === 99 ? fromSeconds - 1 : fromSeconds + id,
       message: text,
       replyTo: top || reply ? new Api.MessageReplyHeader({ replyToMsgId: reply ?? top!, replyToTopId: top }) : undefined,
+      media,
     })
     const messages = [
       message(99, 9, 'outside', 10),
       message(100, 9, 'present primary', 10),
       message(101, 9, 'present alternate', 10),
-      message(102, 9, 'main text', 10),
+      message(102, 9, 'main text', 10, undefined, new Api.MessageMediaPhoto({
+        photo: new Api.Photo({
+          id: bigInt(102),
+          accessHash: bigInt(1),
+          fileReference: Buffer.from([]),
+          date: 0,
+          sizes: [],
+          dcId: 1,
+        }),
+      })),
       message(103, 10, 'aux text', undefined, 10),
       message(104, 11, 'human text', 10),
       message(107, 12, 'unknown bot text', 10),
@@ -216,6 +227,7 @@ describe('bounded recovery repair', () => {
     const takeoutMessages = vi.fn(async function* (_chatId: string, options: Parameters<TakeoutService['takeoutMessages']>[1]) {
       expect(options.startTime).toBe(Date.parse(RECOVERY_REPAIR_FROM_ISO))
       expect(options.endTime).toBe(toMs - 1)
+      expect(options.skipMedia).toBe(true)
       yield* messages
     })
     const service = createRecoveryRepairService({
@@ -267,7 +279,7 @@ describe('bounded recovery repair', () => {
 
     const check = new DatabaseSync(path, { readOnly: true })
     const rows = check.prepare(`SELECT master_msg_id, master_msg_id_alt, slave_message_id, text, slave_origin_uid,
-      slave_member_uid, media_type, mime, msg_type, sent_to, sender_bot_id
+      slave_member_uid, media_type, mime, file_id, file_unique_id, msg_type, sent_to, sender_bot_id
       FROM msglog WHERE master_msg_id IN (?, ?) ORDER BY master_msg_id`).all('-1000000000042.102', '-1000000000042.103')
     check.close()
     expect(rows).toEqual([
@@ -280,6 +292,8 @@ describe('bounded recovery repair', () => {
         slave_member_uid: 'slave.module __self__',
         media_type: 'Text',
         mime: null,
+        file_id: null,
+        file_unique_id: null,
         msg_type: 'Text',
         sent_to: 'blueset.telegram',
         sender_bot_id: null,
@@ -293,6 +307,8 @@ describe('bounded recovery repair', () => {
         slave_member_uid: 'slave.module __self__',
         media_type: 'Text',
         mime: null,
+        file_id: null,
+        file_unique_id: null,
         msg_type: 'Text',
         sent_to: 'blueset.telegram',
         sender_bot_id: '10',
