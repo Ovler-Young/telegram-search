@@ -131,7 +131,6 @@ function parseSlaveModule(slaveUid: string): string {
 
 export function normalizeBindings(rows: Array<Record<string, unknown>>): TopicBinding[] {
   const byTopic = new Map<string, TopicBinding>()
-  const bySlave = new Map<string, string>()
   for (const row of rows) {
     const topicChatId = canonicalInteger(row.topic_chat_id, 'ETM TopicAssoc topic_chat_id')
     const messageThreadId = canonicalInteger(row.message_thread_id, 'ETM TopicAssoc message_thread_id')
@@ -144,11 +143,7 @@ export function normalizeBindings(rows: Array<Record<string, unknown>>): TopicBi
     const existing = byTopic.get(key)
     if (existing && existing.slaveUid !== slaveUid)
       throw new Error(`Conflicting ETM TopicAssoc mapping for ${key}`)
-    const slaveTarget = bySlave.get(slaveUid)
-    if (slaveTarget && slaveTarget !== key)
-      throw new Error(`Conflicting ETM TopicAssoc mapping for slave ${slaveUid}`)
     byTopic.set(key, { topicChatId, messageThreadId, slaveUid, slaveModule })
-    bySlave.set(slaveUid, key)
   }
   const bindings = [...byTopic.values()].sort(compareBindings)
   if (bindings.length === 0)

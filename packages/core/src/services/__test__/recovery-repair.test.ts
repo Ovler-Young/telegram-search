@@ -97,6 +97,17 @@ describe('eTM discovery and bot identity', () => {
     ])).toThrow('Unusable')
   })
 
+  it('deduplicates exact TopicAssoc rows and permits one slave UID on multiple topics', () => {
+    expect(normalizeBindings([
+      { topic_chat_id: '-1000000000042', message_thread_id: '11', slave_uid: 'slave.module chat-a' },
+      { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+      { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+    ])).toEqual([
+      { topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' },
+      { topicChatId: '-1000000000042', messageThreadId: '11', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' },
+    ])
+  })
+
   it('validates a real SQLite schema and checks both MsgLog identity columns', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
     temporaryDirectories.push(directory)
@@ -317,6 +328,119 @@ describe('bounded recovery repair', () => {
 
     const second = await run()
     expect(second).toMatchObject({ summary: { counts: { 'present-primary': 3, 'present-alt': 1, 'inserted': 0 } } })
+  })
+
+  it('imports messages by exact topic key when one slave UID has multiple topic rows', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Bound',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const getInputPeer = vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) }))
+    const insert = vi.fn(async () => ({ inserted: 2, concurrent: 0, conflicts: 0, errors: 0 }))
+    const bindings = normalizeBindings([
+      { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+      { topic_chat_id: '-1000000000042', message_thread_id: '11', slave_uid: 'slave.module chat-a' },
+    ])
+    const service = createRecoveryRepairService({
+      context: {
+        emitter: new EventEmitter(),
+        getClient: () => ({ getEntity: vi.fn(async () => group) }),
+      } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer },
+      takeoutService: {
+        async* takeoutMessages() {
+          yield new Api.Message({
+            id: 150,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt(9) }),
+            date: fromSeconds + 1,
+            message: 'first topic text',
+            replyTo: new Api.MessageReplyHeader({ replyToTopId: 10, replyToMsgId: 10 }),
+          })
+          yield new Api.Message({
+            id: 151,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt(9) }),
+            date: fromSeconds + 2,
+            message: 'second topic text',
+            replyTo: new Api.MessageReplyHeader({ replyToTopId: 11, replyToMsgId: 11 }),
+          })
+        },
+      },
+      inspect: vi.fn(async () => ({ bindings })),
+      presences: vi.fn(async () => new Map()),
+      insert,
+    })
+
+    const updates = []
+    for await (const update of service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 10_000,
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    })) updates.push(update)
+
+    expect(getInputPeer).toHaveBeenCalledTimes(1)
+    expect(insert).toHaveBeenCalledWith(
+      { backend: 'sqlite', path: '/unused' },
+      [
+        expect.objectContaining({
+          identity: '-1000000000042.150',
+          text: 'first topic text',
+          binding: expect.objectContaining({ messageThreadId: '10', slaveUid: 'slave.module chat-a' }),
+        }),
+        expect.objectContaining({
+          identity: '-1000000000042.151',
+          text: 'second topic text',
+          binding: expect.objectContaining({ messageThreadId: '11', slaveUid: 'slave.module chat-a' }),
+        }),
+      ],
+      10,
+    )
+    expect(updates.at(-1)).toMatchObject({ summary: { counts: { inserted: 2 } } })
+  })
+
+  it('aborts before Telegram acquisition when a topic key maps to different slave UIDs', async () => {
+    const getInputPeer = vi.fn()
+    const insert = vi.fn()
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: vi.fn() } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer },
+      takeoutService: { takeoutMessages: vi.fn() },
+      inspect: vi.fn(async () => ({
+        bindings: normalizeBindings([
+          { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+          { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-b' },
+        ]),
+      })),
+      insert,
+    })
+    const run = async () => {
+      for await (const update of service({
+        etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
+        startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 10_000,
+        chunkSize: 10,
+        outputFile: null,
+        takeout: true,
+      })) void update
+      return 'completed'
+    }
+
+    await expect(run()).rejects.toThrow('Conflicting ETM TopicAssoc mapping for -1000000000042.10')
+    expect(getInputPeer).not.toHaveBeenCalled()
+    expect(insert).not.toHaveBeenCalled()
   })
 
   it('aborts before insertion when TopicAssoc changes during acquisition', async () => {
