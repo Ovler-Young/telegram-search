@@ -1,8 +1,9 @@
 import process from 'node:process'
 
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -10,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   emitResult,
   emitStreamResult,
+  isCliEntrypoint,
   normalizeRawArgs,
   resolveExportOutputPath,
   runCli,
@@ -68,6 +70,17 @@ describe('cLI command boundary', () => {
       'query',
       '--profile=work',
     ])
+  })
+
+  it('recognizes a symlinked executable as the CLI entrypoint', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'telegram-search-cli-entrypoint-'))
+    temporaryDirectories.push(directory)
+    const target = join(directory, 'index.mjs')
+    const executable = join(directory, 'tg-search')
+    await writeFile(target, '')
+    await symlink(target, executable)
+
+    expect(isCliEntrypoint(pathToFileURL(target).href, executable)).toBe(true)
   })
 
   it('configures the selected named profile instead of default', async () => {
