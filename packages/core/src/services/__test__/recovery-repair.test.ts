@@ -360,31 +360,97 @@ describe('bounded recovery repair', () => {
     expect(insert).not.toHaveBeenCalled()
   })
 
-  it('rejects a configured identity that is not a matching bot before database inspection', async () => {
-    const inspect = vi.fn()
+  it('trusts configured bot-token IDs without owner-session user resolution and filters senders exactly', async () => {
+    const mainBotId = '8465204282'
+    const binding = {
+      topicChatId: '-1000000000042',
+      messageThreadId: '10',
+      slaveUid: 'slave.module chat-a',
+      slaveModule: 'slave.module',
+    }
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Bound',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const getEntity = vi.fn(async (peer: unknown) => {
+      if (peer instanceof Api.PeerUser)
+        throw new Error('owner session has no cached bot entity')
+      return group
+    })
+    const insert = vi.fn(async () => ({ inserted: 1, concurrent: 0, conflicts: 0, errors: 0 }))
     const service = createRecoveryRepairService({
       context: {
         emitter: new EventEmitter(),
-        getClient: () => ({ getEntity: vi.fn(async () => new Api.User({ id: bigInt(9), firstName: 'Human', bot: false })) }),
+        getClient: () => ({ getEntity }),
       } as unknown as CoreContext,
       logger: logger(),
-      entityService: { getInputPeer: vi.fn() },
-      takeoutService: { takeoutMessages: vi.fn() },
-      inspect,
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: {
+        async* takeoutMessages() {
+          yield new Api.Message({
+            id: 150,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt(mainBotId) }),
+            date: Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000 + 1,
+            message: 'configured bot text',
+            replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+          })
+          yield new Api.Message({
+            id: 151,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt('846520428') }),
+            date: Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000 + 2,
+            message: 'prefix-like text',
+            replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+          })
+          yield new Api.Message({
+            id: 152,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt('84652042820') }),
+            date: Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000 + 3,
+            message: 'suffix-like text',
+            replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+          })
+        },
+      },
+      inspect: vi.fn(async () => ({ bindings: [binding] })),
+      presences: vi.fn(async () => new Map()),
+      insert,
     })
-    const run = async () => {
-      for await (const update of service({
-        etm: { backend: 'sqlite', path: '/unused' },
-        mainBotId: '9',
-        auxiliaryBotIds: [],
-        startedAtMs: Date.now(),
-        chunkSize: 10,
-        outputFile: null,
-        takeout: true,
-      })) void update
-    }
-    await expect(run()).rejects.toThrow('Configured ETM bot ID 9')
-    expect(inspect).not.toHaveBeenCalled()
+
+    const updates = []
+    for await (const update of service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId,
+      auxiliaryBotIds: [],
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 10_000,
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    })) updates.push(update)
+
+    expect(getEntity).not.toHaveBeenCalledWith(expect.any(Api.PeerUser))
+    expect(insert).toHaveBeenCalledWith(
+      { backend: 'sqlite', path: '/unused' },
+      [expect.objectContaining({
+        identity: '-1000000000042.150',
+        senderId: mainBotId,
+        text: 'configured bot text',
+      })],
+      10,
+    )
+    expect(updates.at(-1)).toMatchObject({
+      summary: {
+        counts: {
+          'human-or-unconfigured-sender': 2,
+          'inserted': 1,
+        },
+      },
+    })
   })
 
   it('counts records that become present after the initial snapshot as concurrent conflicts', async () => {

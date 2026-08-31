@@ -17,8 +17,6 @@ import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import bigInt from 'big-integer'
-
 import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { Pool } from 'pg'
 import { Api } from 'telegram'
@@ -237,17 +235,6 @@ export function inspectEtm(source: EtmSource): Promise<EtmInspection> {
 
 function sameBindings(left: TopicBinding[], right: TopicBinding[]): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
-}
-
-async function assertConfiguredBot(client: { getEntity: (entity: Api.TypePeer) => Promise<unknown> }, id: string): Promise<void> {
-  try {
-    const entity = await client.getEntity(new Api.PeerUser({ userId: bigInt(id) }))
-    if (!(entity instanceof Api.User) || entity.bot !== true || entity.id.toString() !== id)
-      throw new Error('Telegram entity is not the configured bot')
-  }
-  catch {
-    throw new Error(`Configured ETM bot ID ${id} did not resolve uniquely to a Telegram bot user`)
-  }
 }
 
 function rawPeerId(peer: Api.TypePeer): string | undefined {
@@ -515,8 +502,6 @@ export function createRecoveryRepairService(options: {
     const taskId = uuidv4()
     yield { type: 'started', taskId }
     const roles = configuredSenderRoles(input.mainBotId, input.auxiliaryBotIds)
-    for (const senderId of [...roles.keys()].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1))
-      await assertConfiguredBot(context.getClient(), senderId)
 
     const before = await inspector(input.etm)
     const groups = [...new Set(before.bindings.map(binding => binding.topicChatId))]
