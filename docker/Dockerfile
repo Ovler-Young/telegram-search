@@ -8,6 +8,9 @@ WORKDIR /app
 RUN corepack enable pnpm && \
     corepack prepare pnpm@10.22.0 --activate
 
+# Install build tools
+RUN apk add --no-cache git && git --version
+
 # Copy dependency manifests
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/core/package.json ./packages/core/package.json
