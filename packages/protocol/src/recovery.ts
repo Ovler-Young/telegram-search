@@ -77,6 +77,24 @@ export type RecoveryRepairUpdate
   = | { type: 'started', taskId: string }
     | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, examined: number }
     | {
+      type: 'topic-binding'
+      taskId: string
+      version: 2
+      topicChatId: string
+      messageThreadId: string
+      slaveUid: string
+      source: 'topic-assoc' | 'msglog-history'
+    }
+    | {
+      type: 'topic-binding-conflict'
+      taskId: string
+      version: 2
+      topicChatId: string
+      messageThreadId: string
+      slaveUids: string[]
+      source: 'msglog-history'
+    }
+    | {
       type: 'slave-summary'
       taskId: string
       version: 2

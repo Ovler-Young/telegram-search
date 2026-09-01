@@ -295,6 +295,93 @@ describe('takeout service', () => {
     expect(init?.fileMaxSize).toBeUndefined()
   })
 
+  it('reads forum replies oldest-first inside the authorized Takeout session', async () => {
+    const calls: Api.AnyRequest[] = []
+    let retryingRead = false
+    const channel = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(99),
+      title: 'Megagroup',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const message = (id: number) => new Api.Message({
+      id,
+      peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+      date: id,
+      message: `message ${id}`,
+      replyTo: new Api.MessageReplyHeader({ replyToTopId: 77, replyToMsgId: 77 }),
+    })
+    const client = {
+      getEntity: vi.fn(async () => channel),
+      invoke: vi.fn(async (query: Api.AnyRequest) => {
+        calls.push(query)
+        if (query instanceof Api.account.InitTakeoutSession)
+          return { id: bigInt(1) }
+        if (!(query instanceof Api.InvokeWithTakeout))
+          throw new Error('unexpected query')
+        if (query.query instanceof Api.messages.GetSplitRanges)
+          return []
+        if (query.query instanceof Api.account.FinishTakeoutSession)
+          return {}
+        if (query.query instanceof Api.messages.GetReplies) {
+          expect(retryingRead).toBe(true)
+          return query.query.offsetId === 1
+            ? { messages: [message(3), message(2), message(1)], users: [], chats: [], count: 3 }
+            : { messages: [], users: [], chats: [], count: 3 }
+        }
+        throw new Error('unexpected Takeout query')
+      }),
+    }
+    const entityService = {
+      getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(99) })),
+    }
+    const { ctx } = createMockCtx(client)
+    const service = createTakeoutService(
+      ctx,
+      logger,
+      mockChatModels,
+      mockChatMessageStatsModels,
+      entityService as any,
+      {
+        async retryTelegramRead<T>(operation: () => Promise<T>) {
+          retryingRead = true
+          try {
+            return await operation()
+          }
+          finally {
+            retryingRead = false
+          }
+        },
+      },
+    )
+    const task = createTask()
+    const yielded: number[] = []
+
+    for await (const result of service.takeoutMessages('42', {
+      pagination: { limit: 3, offset: 0 },
+      replyTo: 77,
+      reverse: true,
+      skipMedia: true,
+      expectedCount: 0,
+      disableAutoProgress: true,
+      takeoutConsent: true,
+      task,
+    })) {
+      yielded.push(result.id)
+    }
+
+    expect(yielded).toEqual([1, 2, 3])
+    const replies = calls
+      .filter((query): query is Api.InvokeWithTakeout => query instanceof Api.InvokeWithTakeout)
+      .map(query => query.query)
+      .filter((query): query is Api.messages.GetReplies => query instanceof Api.messages.GetReplies)
+    expect(replies[0]).toMatchObject({ msgId: 77 })
+    const finished = calls.find(query => query instanceof Api.InvokeWithTakeout && query.query instanceof Api.account.FinishTakeoutSession) as Api.InvokeWithTakeout
+    expect((finished.query as Api.account.FinishTakeoutSession).success).toBe(true)
+  })
+
   it('takeoutMessages should finish unsuccessfully when its consumer stops early', async () => {
     const calls: Api.AnyRequest[] = []
     const client = {

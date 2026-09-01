@@ -66,6 +66,8 @@ export interface EtmInspection {
   slaveNames?: Map<string, SlaveDisplayName>
 }
 
+type HistoricalBindingHits = Map<string, string[]>
+
 export interface RepairCandidate {
   identity: string
   topicChatId: string
@@ -88,7 +90,8 @@ export interface AcquiredMessage {
 }
 
 type UnavailableBoundGroupCategory
-  = | 'missing-input-entity'
+  = | 'broadcast-channel'
+    | 'missing-input-entity'
     | 'channel-invalid'
     | 'channel-private'
     | 'channel-public-group-na'
@@ -100,6 +103,13 @@ interface UnavailableBoundGroup {
   topicChatId: string
   sourceChatId: string
   category: UnavailableBoundGroupCategory
+}
+
+class UnavailableRecoveryGroupError extends Error {
+  constructor(public readonly category: UnavailableBoundGroupCategory, message: string) {
+    super(message)
+    this.name = 'UnavailableRecoveryGroupError'
+  }
 }
 
 type ReportCandidateStatus = 'present-primary' | 'present-alt' | 'repair-attempted'
@@ -185,8 +195,6 @@ export function normalizeBindings(rows: Array<Record<string, unknown>>): TopicBi
     byTopic.set(key, { topicChatId, messageThreadId, slaveUid, slaveModule })
   }
   const bindings = [...byTopic.values()].sort(compareBindings)
-  if (bindings.length === 0)
-    throw new Error('ETM TopicAssoc contains no bound topics')
   return bindings
 }
 
@@ -320,9 +328,9 @@ async function postgresSlaveDisplayName(client: PoolClient, slaveUid: string, ha
     : fallbackSlaveName(slaveUid)
 }
 
-async function postgresSlaveDisplayNames(client: PoolClient, bindings: TopicBinding[], hasSlaveChatInfo: boolean): Promise<Map<string, SlaveDisplayName>> {
+async function postgresSlaveDisplayNames(client: PoolClient, slaveUids: string[], hasSlaveChatInfo: boolean): Promise<Map<string, SlaveDisplayName>> {
   const slaveNames = new Map<string, SlaveDisplayName>()
-  for (const slaveUid of [...new Set(bindings.map(binding => binding.slaveUid))].sort())
+  for (const slaveUid of [...new Set(slaveUids)].sort())
     slaveNames.set(slaveUid, await postgresSlaveDisplayName(client, slaveUid, hasSlaveChatInfo))
   return slaveNames
 }
@@ -342,7 +350,7 @@ async function inspectPostgres(source: Extract<EtmSource, { backend: 'postgres' 
     const bindings = normalizeBindings(rows.rows)
     const slaveNames = await postgresSlaveDisplayNames(
       client,
-      bindings,
+      bindings.map(binding => binding.slaveUid),
       hasColumns(columns.rows.filter(row => row.table_name === 'slavechatinfo').map(row => row.column_name), SLAVE_CHAT_INFO_COLUMNS),
     )
     await client.query('COMMIT')
@@ -362,6 +370,155 @@ export function inspectEtm(source: EtmSource): Promise<EtmInspection> {
   return source.backend === 'sqlite'
     ? Promise.resolve(inspectSqlite(source.path))
     : inspectPostgres(source)
+}
+
+function canonicalHistoricalGroupId(value: unknown): string | undefined {
+  try {
+    return parseEtmGroupId(String(value)).topicChatId
+  }
+  catch {
+    return undefined
+  }
+}
+
+function sqliteHistoricalGroupIds(path: string): string[] {
+  const database = new DatabaseSync(path, { readOnly: true })
+  try {
+    const rows = database.prepare(`
+      SELECT DISTINCT substr(identity, 1, instr(identity, '.') - 1) AS topic_chat_id
+      FROM (
+        SELECT master_msg_id AS identity FROM msglog
+        UNION ALL
+        SELECT master_msg_id_alt AS identity FROM msglog WHERE master_msg_id_alt IS NOT NULL
+      )
+      WHERE identity GLOB '-[0-9]*.[1-9]*'
+        AND identity NOT GLOB '*[^0-9.-]*'
+        AND substr(identity, 2, instr(identity, '.') - 2) NOT GLOB '*[^0-9]*'
+        AND substr(identity, instr(identity, '.') + 1) NOT GLOB '*[^0-9]*'
+        AND instr(substr(identity, instr(identity, '.') + 1), '.') = 0
+    `).all()
+    return [...new Set(rows.map(row => canonicalHistoricalGroupId(row.topic_chat_id)).filter(value => value !== undefined))]
+      .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : 1)
+  }
+  finally {
+    database.close()
+  }
+}
+
+export async function readHistoricalGroupIds(source: EtmSource): Promise<string[]> {
+  if (source.backend === 'sqlite')
+    return sqliteHistoricalGroupIds(source.path)
+  const pool = createPostgresPool(source)
+  const client = await pool.connect()
+  try {
+    const result = await client.query<{ topic_chat_id: string }>(`
+      SELECT DISTINCT substring(identity FROM '^(-[0-9]+)\\.[1-9][0-9]*$') AS topic_chat_id
+      FROM (
+        SELECT master_msg_id AS identity FROM msglog
+        UNION ALL
+        SELECT master_msg_id_alt AS identity FROM msglog WHERE master_msg_id_alt IS NOT NULL
+      ) identities
+      WHERE identity ~ '^-[0-9]+\\.[1-9][0-9]*$'
+    `)
+    return [...new Set(result.rows.map(row => canonicalHistoricalGroupId(row.topic_chat_id)).filter(value => value !== undefined))]
+      .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : 1)
+  }
+  finally {
+    client.release()
+    await pool.end()
+  }
+}
+
+function sqliteHistoricalBindingHits(path: string, identities: string[]): HistoricalBindingHits {
+  if (identities.length === 0)
+    return new Map()
+  const database = new DatabaseSync(path, { readOnly: true })
+  try {
+    const placeholders = identities.map(() => '?').join(', ')
+    const rows = database.prepare(`
+      SELECT master_msg_id, master_msg_id_alt, slave_origin_uid FROM msglog
+      WHERE master_msg_id IN (${placeholders}) OR master_msg_id_alt IN (${placeholders})
+    `).all(...identities, ...identities)
+    const hits: HistoricalBindingHits = new Map()
+    for (const row of rows) {
+      const slaveUid = String(row.slave_origin_uid ?? '').trim()
+      if (!slaveUid)
+        continue
+      for (const identity of [row.master_msg_id, row.master_msg_id_alt].map(String)) {
+        if (!identities.includes(identity))
+          continue
+        hits.set(identity, [...new Set([...(hits.get(identity) ?? []), slaveUid])].sort())
+      }
+    }
+    return hits
+  }
+  finally {
+    database.close()
+  }
+}
+
+export async function readHistoricalBindingHits(source: EtmSource, identities: string[]): Promise<HistoricalBindingHits> {
+  if (source.backend === 'sqlite')
+    return sqliteHistoricalBindingHits(source.path, identities)
+  if (identities.length === 0)
+    return new Map()
+  const pool = createPostgresPool(source)
+  const client = await pool.connect()
+  try {
+    const result = await client.query<{ master_msg_id: string, master_msg_id_alt: string | null, slave_origin_uid: string }>(`
+      SELECT master_msg_id, master_msg_id_alt, slave_origin_uid FROM msglog
+      WHERE master_msg_id = ANY($1::text[]) OR master_msg_id_alt = ANY($1::text[])
+    `, [identities])
+    const hits: HistoricalBindingHits = new Map()
+    for (const row of result.rows) {
+      const slaveUid = String(row.slave_origin_uid ?? '').trim()
+      if (!slaveUid)
+        continue
+      for (const identity of [row.master_msg_id, row.master_msg_id_alt]) {
+        if (!identity || !identities.includes(identity))
+          continue
+        hits.set(identity, [...new Set([...(hits.get(identity) ?? []), slaveUid])].sort())
+      }
+    }
+    return hits
+  }
+  finally {
+    client.release()
+    await pool.end()
+  }
+}
+
+export async function readSlaveDisplayNames(source: EtmSource, slaveUids: string[]): Promise<Map<string, SlaveDisplayName>> {
+  const unique = [...new Set(slaveUids)].sort()
+  if (unique.length === 0)
+    return new Map()
+  if (source.backend === 'sqlite') {
+    const database = new DatabaseSync(source.path, { readOnly: true })
+    try {
+      const hasSlaveChatInfo = hasColumns(sqliteColumns(database, 'slavechatinfo'), SLAVE_CHAT_INFO_COLUMNS)
+      return new Map(unique.map(slaveUid => [slaveUid, sqliteSlaveDisplayName(database, slaveUid, hasSlaveChatInfo)]))
+    }
+    finally {
+      database.close()
+    }
+  }
+  const pool = createPostgresPool(source)
+  const client = await pool.connect()
+  try {
+    const columns = await client.query<{ column_name: string }>(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'slavechatinfo'
+    `)
+    return postgresSlaveDisplayNames(
+      client,
+      unique,
+      hasColumns(columns.rows.map(row => row.column_name), SLAVE_CHAT_INFO_COLUMNS),
+    )
+  }
+  finally {
+    client.release()
+    await pool.end()
+  }
 }
 
 function sameBindings(left: TopicBinding[], right: TopicBinding[]): boolean {
@@ -401,6 +558,8 @@ const UNAVAILABLE_RPC_ERRORS = new Map<string, UnavailableBoundGroupCategory>([
 ])
 
 function classifyUnavailableBoundGroup(error: unknown): UnavailableBoundGroupCategory | undefined {
+  if (error instanceof UnavailableRecoveryGroupError)
+    return error.category
   const message = error instanceof Error ? error.message : String(error)
   if (
     message.startsWith('Could not find the input entity for ')
@@ -816,6 +975,81 @@ function buildSlaveSummaryEvents(
   }).sort(compareSlaveIdentity)
 }
 
+interface HistoricalTopicResolution {
+  binding?: TopicBinding
+  conflictSlaveUids?: string[]
+}
+
+async function discoverHistoricalTopicBinding(
+  context: CoreContext,
+  logger: Logger,
+  takeoutService: Pick<TakeoutService, 'takeoutMessages'>,
+  inputPeer: Api.TypeInputPeer,
+  topicChatId: string,
+  messageThreadId: string,
+  source: EtmSource,
+  takeoutConsent: boolean,
+  readHits: typeof readHistoricalBindingHits,
+  signal?: AbortSignal,
+): Promise<HistoricalTopicResolution> {
+  const batch: string[] = []
+  const slaveUids = new Set<string>()
+  const inspectBatch = async (): Promise<boolean> => {
+    const hits = await readHits(source, [...batch])
+    batch.length = 0
+    for (const slaveUid of [...hits.values()].flat())
+      slaveUids.add(slaveUid)
+    return slaveUids.size > 1
+  }
+
+  const group = parseEtmGroupId(topicChatId)
+  const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
+  const abortTask = () => task.abort()
+  signal?.addEventListener('abort', abortTask, { once: true })
+  try {
+    for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
+      pagination: { limit: 100, offset: 0 },
+      inputPeer,
+      replyTo: Number(messageThreadId),
+      reverse: true,
+      skipMedia: true,
+      expectedCount: 0,
+      disableAutoProgress: true,
+      takeoutConsent,
+      task,
+    })) {
+      if (signal?.aborted)
+        throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
+      if (rawPeerId(message.peerId) !== group.sourceChatId)
+        continue
+      batch.push(`${topicChatId}.${message.id}`)
+      if (batch.length < 10)
+        continue
+      if (await inspectBatch())
+        return { conflictSlaveUids: [...slaveUids].sort() }
+    }
+    if (task.state.lastError)
+      throw task.state.rawError ?? new Error(task.state.lastError)
+    if (batch.length > 0 && await inspectBatch())
+      return { conflictSlaveUids: [...slaveUids].sort() }
+    if (slaveUids.size === 1) {
+      const slaveUid = [...slaveUids][0]
+      return {
+        binding: {
+          topicChatId,
+          messageThreadId,
+          slaveUid,
+          slaveModule: parseSlaveModule(slaveUid),
+        },
+      }
+    }
+    return {}
+  }
+  finally {
+    signal?.removeEventListener('abort', abortTask)
+  }
+}
+
 function unavailableBindingReports(
   bindings: TopicBinding[],
   slaveNames: Map<string, SlaveDisplayName>,
@@ -887,11 +1121,18 @@ export function createRecoveryRepairService(options: {
   entityService: Pick<EntityService, 'getInputPeer'>
   takeoutService: Pick<TakeoutService, 'takeoutMessages'>
   inspect?: typeof inspectEtm
+  historicalGroups?: typeof readHistoricalGroupIds
+  historicalBindingHits?: typeof readHistoricalBindingHits
+  slaveDisplayNames?: typeof readSlaveDisplayNames
   presences?: typeof readInitialPresences
   insert?: typeof insertRepairCandidates
 }) {
   const { context, entityService, logger, takeoutService } = options
   const inspector = options.inspect ?? inspectEtm
+  const historicalGroupReader = options.historicalGroups ?? (options.inspect ? async () => [] : readHistoricalGroupIds)
+  const historicalBindingReader = options.historicalBindingHits ?? readHistoricalBindingHits
+  const slaveNameReader = options.slaveDisplayNames ?? (options.inspect ? async () => new Map() : readSlaveDisplayNames)
+  const discoverHistoricalBindings = !options.inspect || options.historicalBindingHits !== undefined
   const presenceReader = options.presences ?? readInitialPresences
   const inserter = options.insert ?? insertRepairCandidates
 
@@ -907,7 +1148,9 @@ export function createRecoveryRepairService(options: {
     let examined = 0
     let reportStarted = false
     const before = await inspector(input.etm)
-    const groups = [...new Set(before.bindings.map(binding => binding.topicChatId))]
+    const historicalGroupIds = await historicalGroupReader(input.etm)
+    const topicAssocGroupIds = new Set(before.bindings.map(binding => binding.topicChatId))
+    const groups = [...new Set([...topicAssocGroupIds, ...historicalGroupIds])]
       .map(parseEtmGroupId)
       .sort((a, b) => BigInt(a.topicChatId) < BigInt(b.topicChatId) ? -1 : 1)
 
@@ -930,14 +1173,18 @@ export function createRecoveryRepairService(options: {
         if (signal?.aborted)
           throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
         const groupMessages = new Map<string, AcquiredMessage>()
+        let inputPeer: Api.TypeInputPeer | undefined
         const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
         const abortTask = () => task.abort()
         signal?.addEventListener('abort', abortTask, { once: true })
         try {
-          const inputPeer = await entityService.getInputPeer(group.sourceChatId)
+          inputPeer = await entityService.getInputPeer(group.sourceChatId)
           assertGroupInputPeer(group, inputPeer)
           const entity = await context.getClient().getEntity(inputPeer)
-          if (group.expectedPeer === 'channel' && (!(entity instanceof Api.Channel) || !entity.megagroup || entity.id.toString() !== group.sourceChatId))
+          if (group.expectedPeer === 'channel' && entity instanceof Api.Channel && entity.id.toString() === group.sourceChatId && !entity.megagroup) {
+            throw new UnavailableRecoveryGroupError('broadcast-channel', `Recovery group ${group.topicChatId} is a broadcast channel`)
+          }
+          if (group.expectedPeer === 'channel' && (!(entity instanceof Api.Channel) || entity.id.toString() !== group.sourceChatId))
             throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected supergroup`)
           if (group.expectedPeer === 'chat' && (!(entity instanceof Api.Chat) || entity.id.toString() !== group.sourceChatId))
             throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected basic group`)
@@ -1022,6 +1269,39 @@ export function createRecoveryRepairService(options: {
           throw new Error(`ETM TopicAssoc mappings changed for ${group.topicChatId} during Telegram acquisition; repair aborted`)
 
         const bindings = new Map(currentGroupBindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, binding]))
+        const bindingSources = new Map<string, 'topic-assoc' | 'msglog-history'>(
+          currentGroupBindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, 'topic-assoc']),
+        )
+        const bindingConflicts: Array<{ messageThreadId: string, slaveUids: string[] }> = []
+        const unboundTopicIds = [...new Set([...groupMessages.values()]
+          .map(message => message.topicId)
+          .filter(topicId => topicId !== undefined)
+          .filter(topicId => !bindings.has(`${group.topicChatId}.${topicId}`)))]
+          .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : 1)
+        for (const messageThreadId of discoverHistoricalBindings ? unboundTopicIds : []) {
+          const resolution = await discoverHistoricalTopicBinding(
+            context,
+            logger,
+            takeoutService,
+            inputPeer!,
+            group.topicChatId,
+            messageThreadId,
+            input.etm,
+            input.takeout,
+            historicalBindingReader,
+            signal,
+          )
+          if (resolution.binding) {
+            bindings.set(`${group.topicChatId}.${messageThreadId}`, resolution.binding)
+            bindingSources.set(`${group.topicChatId}.${messageThreadId}`, 'msglog-history')
+          }
+          else if (resolution.conflictSlaveUids) {
+            bindingConflicts.push({ messageThreadId, slaveUids: resolution.conflictSlaveUids })
+          }
+        }
+        const beforeWrite = await inspector(input.etm)
+        if (!sameBindings(currentGroupBindings, bindingsForGroup(beforeWrite.bindings, group.topicChatId)))
+          throw new Error(`ETM TopicAssoc mappings changed for ${group.topicChatId} during historical binding discovery; repair aborted`)
         const groupResult = buildGroupCandidates(groupMessages.values(), bindings, roles)
         const presences = await presenceReader(input.etm, groupResult.candidates.map(candidate => candidate.identity))
         const missing = splitCandidatesByPresence(groupResult.candidates, presences, groupResult.counts, groupResult.slaveCounts)
@@ -1030,10 +1310,39 @@ export function createRecoveryRepairService(options: {
         applySlaveInsertOutcome(missing, outcome, groupResult.slaveCounts)
         addCounts(counts, groupResult.counts)
         examined += groupMessages.size
+        const discoveredSlaveNames = await slaveNameReader(
+          input.etm,
+          [...new Set([...bindings.values()].map(binding => binding.slaveUid))],
+        )
+        const allSlaveNames = new Map([
+          ...inspectionSlaveNames(beforeWrite),
+          ...discoveredSlaveNames,
+        ])
+        const bindingEvents = [...bindings.values()]
+          .filter(binding => bindingSources.get(`${binding.topicChatId}.${binding.messageThreadId}`) === 'msglog-history')
+          .sort(compareBindings)
+          .map(binding => ({
+            type: 'topic-binding' as const,
+            taskId,
+            version: 2 as const,
+            topicChatId: binding.topicChatId,
+            messageThreadId: binding.messageThreadId,
+            slaveUid: binding.slaveUid,
+            source: 'msglog-history' as const,
+          }))
+        const conflictEvents = bindingConflicts.map(conflict => ({
+          type: 'topic-binding-conflict' as const,
+          taskId,
+          version: 2 as const,
+          topicChatId: group.topicChatId,
+          messageThreadId: conflict.messageThreadId,
+          slaveUids: conflict.slaveUids,
+          source: 'msglog-history' as const,
+        }))
         const slaveSummaries = buildSlaveSummaryEvents(
           taskId,
           group.topicChatId,
-          inspectionSlaveNames(afterGroup),
+          allSlaveNames,
           groupResult.slaveCounts,
         )
         const groupComplete = {
@@ -1047,6 +1356,10 @@ export function createRecoveryRepairService(options: {
         } as const
 
         if (input.outputFile) {
+          for (const event of bindingEvents)
+            await appendReportEvent(input.outputFile, { runId: taskId, ...event })
+          for (const event of conflictEvents)
+            await appendReportEvent(input.outputFile, { runId: taskId, ...event })
           for (const event of slaveSummaries)
             await appendReportEvent(input.outputFile, { runId: taskId, ...event })
           await appendReportEvent(input.outputFile, {
@@ -1060,6 +1373,10 @@ export function createRecoveryRepairService(options: {
           })
         }
 
+        for (const event of bindingEvents)
+          yield event
+        for (const event of conflictEvents)
+          yield event
         for (const event of slaveSummaries)
           yield event
         yield groupComplete

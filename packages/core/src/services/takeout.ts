@@ -215,7 +215,7 @@ export function createTakeoutService(
    * https://core.telegram.org/api/takeout
    */
   function buildInvokeQuery(
-    historyQuery: Api.messages.GetHistory,
+    historyQuery: Api.messages.GetHistory | Api.messages.GetReplies,
     takeoutSession: Api.account.Takeout,
     range: Api.MessageRange | undefined,
   ): Api.AnyRequest {
@@ -245,10 +245,14 @@ export function createTakeoutService(
     const { task } = options
     const limit = options.pagination.limit
     const minId = normalizeId(options.minId, 0)
-    const maxId = normalizeId(options.maxId, 0)
+    const configuredMaxId = normalizeId(options.maxId, 0)
+    const reverse = options.reverse === true
+    const maxId = reverse && configuredMaxId === 0 ? 2_147_483_647 : configuredMaxId
 
     // Reset pagination for each split range
     let offsetId = range ? 0 : normalizeId(options.pagination.offset, 0)
+    if (reverse)
+      offsetId = offsetId ? offsetId + 1 : 1
     let hasMore = true
 
     while (hasMore && !task.state.abortController.signal.aborted) {
@@ -258,11 +262,11 @@ export function createTakeoutService(
       // Resolve peer via entityService to get the correct InputPeer type and accessHash
       // from the DB, avoiding misidentification (e.g. channel treated as PeerUser).
       const peer = options.inputPeer ?? await entityService.getInputPeer(chatId)
-      const historyQuery = new Api.messages.GetHistory({
+      const commonHistoryOptions = {
         peer,
         offsetId,
-        addOffset: 0,
-        // GetHistory treats offsetDate as exclusive. The Takeout service's
+        addOffset: reverse ? -limit : 0,
+        // Telegram treats offsetDate as exclusive. The Takeout service's
         // endTime contract is inclusive, so advance to the following second.
         offsetDate: options.endTime === undefined ? 0 : Math.floor(options.endTime / 1000) + 1,
         limit,
@@ -271,7 +275,10 @@ export function createTakeoutService(
         // Takeout exports must force a complete response. A result hash is only
         // valid when calculated from a previously fetched result set.
         hash: bigInt.zero,
-      })
+      }
+      const historyQuery = options.replyTo === undefined
+        ? new Api.messages.GetHistory(commonHistoryOptions)
+        : new Api.messages.GetReplies({ ...commonHistoryOptions, msgId: options.replyTo })
 
       logger.withFields(historyQuery).verbose('Historical messages query')
 
@@ -303,7 +310,7 @@ export function createTakeoutService(
         break
       }
 
-      const messages = result.messages
+      const messages = reverse ? [...result.messages].reverse() : result.messages
 
       ctx.metrics?.takeoutPageMessages.observe({}, messages.length)
 
@@ -331,9 +338,15 @@ export function createTakeoutService(
 
         // Time range filtering
         if (options.endTime !== undefined && message.date > options.endTime / 1000) {
+          if (reverse) {
+            hasMore = false
+            break
+          }
           continue
         }
         if (options.startTime !== undefined && message.date < options.startTime / 1000) {
+          if (reverse)
+            continue
           hasMore = false
           break
         }
@@ -346,7 +359,7 @@ export function createTakeoutService(
         yield message
       }
 
-      offsetId = normalizeId(messages[messages.length - 1]?.id, offsetId)
+      offsetId = normalizeId(messages[messages.length - 1]?.id, offsetId) + (reverse ? 1 : 0)
 
       // Only emit progress if auto-progress is enabled
       if (!options.disableAutoProgress) {
@@ -404,7 +417,10 @@ export function createTakeoutService(
 
       if (splitRanges.length > 0) {
         // Iterate each split range separately, resetting pagination per range
-        for (const range of splitRanges) {
+        const ranges = options.reverse
+          ? [...splitRanges].sort((left, right) => left.minId - right.minId)
+          : splitRanges
+        for (const range of ranges) {
           if (task.state.abortController.signal.aborted) {
             break
           }

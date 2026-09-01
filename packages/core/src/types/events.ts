@@ -462,6 +462,10 @@ export interface TakeoutOpts {
   minId?: number
   maxId?: number
 
+  // Restrict history to one forum topic and page from oldest to newest.
+  replyTo?: number
+  reverse?: boolean
+
   // Expected total count for progress calculation (optional, will fetch from Telegram if not provided)
   expectedCount?: number
 
