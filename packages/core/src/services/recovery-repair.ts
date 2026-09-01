@@ -47,6 +47,64 @@ const MSGLOG_COLUMNS = [
   'sender_bot_id',
   'time',
 ] as const
+const ACQUISITION_PROGRESS_INTERVAL = 10_000
+const HEARTBEAT_INTERVAL_MS = 60_000
+
+interface IteratorHeartbeat {
+  kind: 'heartbeat'
+  elapsedMs: number
+  idleMs: number
+}
+
+interface IteratorValue<T> {
+  kind: 'value'
+  value: T
+}
+
+async function* withIteratorHeartbeat<T>(source: AsyncIterable<T>): AsyncGenerator<IteratorHeartbeat | IteratorValue<T>> {
+  const iterator = source[Symbol.asyncIterator]()
+  const startedAt = Date.now()
+  let lastValueAt = startedAt
+  let completed = false
+  try {
+    while (true) {
+      const pending = iterator.next()
+      while (true) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const heartbeat = new Promise<{ kind: 'heartbeat' }>((resolve) => {
+          timer = setTimeout(() => resolve({ kind: 'heartbeat' }), HEARTBEAT_INTERVAL_MS)
+        })
+        let result: { kind: 'heartbeat' } | { kind: 'result', value: IteratorResult<T> }
+        try {
+          result = await Promise.race([
+            pending.then(value => ({ kind: 'result' as const, value })),
+            heartbeat,
+          ])
+        }
+        finally {
+          if (timer)
+            clearTimeout(timer)
+        }
+        if (result.kind === 'heartbeat') {
+          const now = Date.now()
+          yield { kind: 'heartbeat', elapsedMs: now - startedAt, idleMs: now - lastValueAt }
+          continue
+        }
+        if (result.value.done) {
+          completed = true
+          return
+        }
+        lastValueAt = Date.now()
+        yield { kind: 'value', value: result.value.value }
+        break
+      }
+    }
+  }
+  finally {
+    if (!completed)
+      await iterator.return?.()
+  }
+}
 
 export interface TopicBinding {
   topicChatId: string
@@ -980,7 +1038,12 @@ interface HistoricalTopicResolution {
   conflictSlaveUids?: string[]
 }
 
-async function discoverHistoricalTopicBinding(
+type HistoricalTopicDiscoveryUpdate = Extract<RecoveryRepairUpdate, {
+  type: 'topic-binding-discovery' | 'topic-binding-discovery-heartbeat'
+}>
+
+async function* discoverHistoricalTopicBinding(
+  taskId: string,
   context: CoreContext,
   logger: Logger,
   takeoutService: Pick<TakeoutService, 'takeoutMessages'>,
@@ -991,23 +1054,37 @@ async function discoverHistoricalTopicBinding(
   takeoutConsent: boolean,
   readHits: typeof readHistoricalBindingHits,
   signal?: AbortSignal,
-): Promise<HistoricalTopicResolution> {
+): AsyncGenerator<HistoricalTopicDiscoveryUpdate, HistoricalTopicResolution> {
   const batch: string[] = []
-  const slaveUids = new Set<string>()
-  const inspectBatch = async (): Promise<boolean> => {
+  let anchorsExamined = 0
+  const inspectBatch = async (): Promise<HistoricalTopicResolution | undefined> => {
     const hits = await readHits(source, [...batch])
+    anchorsExamined += batch.length
     batch.length = 0
-    for (const slaveUid of [...hits.values()].flat())
-      slaveUids.add(slaveUid)
-    return slaveUids.size > 1
+    const slaveUids = [...new Set([...hits.values()].flat().map(value => value.trim()).filter(Boolean))].sort()
+    if (slaveUids.length > 1)
+      return { conflictSlaveUids: slaveUids }
+    if (slaveUids.length === 1) {
+      const slaveUid = slaveUids[0]
+      return {
+        binding: {
+          topicChatId,
+          messageThreadId,
+          slaveUid,
+          slaveModule: parseSlaveModule(slaveUid),
+        },
+      }
+    }
   }
+
+  yield { type: 'topic-binding-discovery', taskId, version: 2, topicChatId, messageThreadId, status: 'started' }
 
   const group = parseEtmGroupId(topicChatId)
   const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
   const abortTask = () => task.abort()
   signal?.addEventListener('abort', abortTask, { once: true })
   try {
-    for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
+    const messages = takeoutService.takeoutMessages(group.sourceChatId, {
       pagination: { limit: 100, offset: 0 },
       inputPeer,
       replyTo: Number(messageThreadId),
@@ -1017,7 +1094,22 @@ async function discoverHistoricalTopicBinding(
       disableAutoProgress: true,
       takeoutConsent,
       task,
-    })) {
+    })
+    for await (const item of withIteratorHeartbeat(messages)) {
+      if (item.kind === 'heartbeat') {
+        yield {
+          type: 'topic-binding-discovery-heartbeat',
+          taskId,
+          version: 2,
+          topicChatId,
+          messageThreadId,
+          anchorsChecked: anchorsExamined,
+          elapsedMs: item.elapsedMs,
+          idleMs: item.idleMs,
+        }
+        continue
+      }
+      const message = item.value
       if (signal?.aborted)
         throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
       if (rawPeerId(message.peerId) !== group.sourceChatId)
@@ -1025,23 +1117,52 @@ async function discoverHistoricalTopicBinding(
       batch.push(`${topicChatId}.${message.id}`)
       if (batch.length < 10)
         continue
-      if (await inspectBatch())
-        return { conflictSlaveUids: [...slaveUids].sort() }
+      const resolution = await inspectBatch()
+      if (resolution) {
+        const slaveUids = resolution.conflictSlaveUids
+        yield {
+          type: 'topic-binding-discovery',
+          taskId,
+          version: 2,
+          topicChatId,
+          messageThreadId,
+          status: 'completed',
+          anchorsExamined,
+          outcome: resolution.binding ? 'resolved' : 'conflict',
+          ...(resolution.binding ? { slaveUid: resolution.binding.slaveUid } : { slaveUids }),
+        }
+        return resolution
+      }
     }
     if (task.state.lastError)
       throw task.state.rawError ?? new Error(task.state.lastError)
-    if (batch.length > 0 && await inspectBatch())
-      return { conflictSlaveUids: [...slaveUids].sort() }
-    if (slaveUids.size === 1) {
-      const slaveUid = [...slaveUids][0]
-      return {
-        binding: {
+    if (batch.length > 0) {
+      const resolution = await inspectBatch()
+      if (resolution) {
+        const slaveUids = resolution.conflictSlaveUids
+        yield {
+          type: 'topic-binding-discovery',
+          taskId,
+          version: 2,
           topicChatId,
           messageThreadId,
-          slaveUid,
-          slaveModule: parseSlaveModule(slaveUid),
-        },
+          status: 'completed',
+          anchorsExamined,
+          outcome: resolution.binding ? 'resolved' : 'conflict',
+          ...(resolution.binding ? { slaveUid: resolution.binding.slaveUid } : { slaveUids }),
+        }
+        return resolution
       }
+    }
+    yield {
+      type: 'topic-binding-discovery',
+      taskId,
+      version: 2,
+      topicChatId,
+      messageThreadId,
+      status: 'completed',
+      anchorsExamined,
+      outcome: 'not-found',
     }
     return {}
   }
@@ -1147,12 +1268,24 @@ export function createRecoveryRepairService(options: {
     const counts = emptyCounts()
     let examined = 0
     let reportStarted = false
+    yield { type: 'recovery-stage', taskId, version: 2, stage: 'etm-inspection', status: 'started' }
     const before = await inspector(input.etm)
+    yield { type: 'recovery-stage', taskId, version: 2, stage: 'etm-inspection', status: 'completed', bindingCount: before.bindings.length }
+    yield { type: 'recovery-stage', taskId, version: 2, stage: 'historical-group-discovery', status: 'started' }
     const historicalGroupIds = await historicalGroupReader(input.etm)
     const topicAssocGroupIds = new Set(before.bindings.map(binding => binding.topicChatId))
     const groups = [...new Set([...topicAssocGroupIds, ...historicalGroupIds])]
       .map(parseEtmGroupId)
       .sort((a, b) => BigInt(a.topicChatId) < BigInt(b.topicChatId) ? -1 : 1)
+    yield {
+      type: 'recovery-stage',
+      taskId,
+      version: 2,
+      stage: 'historical-group-discovery',
+      status: 'completed',
+      historicalGroupCount: historicalGroupIds.length,
+      groupCount: groups.length,
+    }
 
     try {
       if (input.outputFile) {
@@ -1173,6 +1306,20 @@ export function createRecoveryRepairService(options: {
         if (signal?.aborted)
           throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
         const groupMessages = new Map<string, AcquiredMessage>()
+        let acquired = 0
+        const initialGroupBindings = bindingsForGroup(before.bindings, group.topicChatId)
+        const groupStart = {
+          type: 'group-start',
+          taskId,
+          version: 2,
+          topicChatId: group.topicChatId,
+          sourceChatId: group.sourceChatId,
+          source: topicAssocGroupIds.has(group.topicChatId) ? 'topic-assoc' : 'msglog-history',
+          bindingCount: initialGroupBindings.length,
+        } as const
+        yield groupStart
+        if (input.outputFile)
+          await appendReportEvent(input.outputFile, { runId: taskId, ...groupStart })
         let inputPeer: Api.TypeInputPeer | undefined
         const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
         const abortTask = () => task.abort()
@@ -1189,7 +1336,7 @@ export function createRecoveryRepairService(options: {
           if (group.expectedPeer === 'chat' && (!(entity instanceof Api.Chat) || entity.id.toString() !== group.sourceChatId))
             throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected basic group`)
 
-          for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
+          const messages = takeoutService.takeoutMessages(group.sourceChatId, {
             pagination: { limit: 100, offset: 0 },
             inputPeer,
             startTime: fromMs,
@@ -1199,7 +1346,25 @@ export function createRecoveryRepairService(options: {
             disableAutoProgress: true,
             takeoutConsent: input.takeout,
             task,
-          })) {
+          })
+          for await (const item of withIteratorHeartbeat(messages)) {
+            if (item.kind === 'heartbeat') {
+              const heartbeat = {
+                type: 'group-acquisition-heartbeat',
+                taskId,
+                version: 2,
+                topicChatId: group.topicChatId,
+                sourceChatId: group.sourceChatId,
+                acquired,
+                elapsedMs: item.elapsedMs,
+                idleMs: item.idleMs,
+              } as const
+              yield heartbeat
+              if (input.outputFile)
+                await appendReportEvent(input.outputFile, { runId: taskId, ...heartbeat })
+              continue
+            }
+            const message = item.value
             const timestamp = message.date * 1000
             if (timestamp < fromMs || timestamp >= toMs)
               continue
@@ -1210,6 +1375,7 @@ export function createRecoveryRepairService(options: {
             const topicId = message.replyTo instanceof Api.MessageReplyHeader
               ? (message.replyTo.replyToTopId ?? message.replyTo.replyToMsgId)?.toString()
               : undefined
+            acquired += 1
             groupMessages.set(`${group.topicChatId}.${messageId}`, {
               topicChatId: group.topicChatId,
               sourceChatId: group.sourceChatId,
@@ -1219,6 +1385,19 @@ export function createRecoveryRepairService(options: {
               text: message.message,
               topicId,
             })
+            if (acquired % ACQUISITION_PROGRESS_INTERVAL === 0) {
+              const acquisitionProgress = {
+                type: 'group-acquisition-progress',
+                taskId,
+                version: 2,
+                topicChatId: group.topicChatId,
+                sourceChatId: group.sourceChatId,
+                acquired,
+              } as const
+              yield acquisitionProgress
+              if (input.outputFile)
+                await appendReportEvent(input.outputFile, { runId: taskId, ...acquisitionProgress })
+            }
           }
           if (task.state.lastError)
             throw task.state.rawError ?? new Error(task.state.lastError)
@@ -1263,7 +1442,6 @@ export function createRecoveryRepairService(options: {
         }
 
         const afterGroup = await inspector(input.etm)
-        const initialGroupBindings = bindingsForGroup(before.bindings, group.topicChatId)
         const currentGroupBindings = bindingsForGroup(afterGroup.bindings, group.topicChatId)
         if (!sameBindings(initialGroupBindings, currentGroupBindings))
           throw new Error(`ETM TopicAssoc mappings changed for ${group.topicChatId} during Telegram acquisition; repair aborted`)
@@ -1279,7 +1457,8 @@ export function createRecoveryRepairService(options: {
           .filter(topicId => !bindings.has(`${group.topicChatId}.${topicId}`)))]
           .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : 1)
         for (const messageThreadId of discoverHistoricalBindings ? unboundTopicIds : []) {
-          const resolution = await discoverHistoricalTopicBinding(
+          const discovery = discoverHistoricalTopicBinding(
+            taskId,
             context,
             logger,
             takeoutService,
@@ -1291,6 +1470,17 @@ export function createRecoveryRepairService(options: {
             historicalBindingReader,
             signal,
           )
+          let resolution: HistoricalTopicResolution
+          while (true) {
+            const step = await discovery.next()
+            if (step.done) {
+              resolution = step.value
+              break
+            }
+            yield step.value
+            if (input.outputFile)
+              await appendReportEvent(input.outputFile, { runId: taskId, ...step.value })
+          }
           if (resolution.binding) {
             bindings.set(`${group.topicChatId}.${messageThreadId}`, resolution.binding)
             bindingSources.set(`${group.topicChatId}.${messageThreadId}`, 'msglog-history')

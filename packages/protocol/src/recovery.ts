@@ -75,7 +75,81 @@ export interface RecoveryRepairSummary {
 
 export type RecoveryRepairUpdate
   = | { type: 'started', taskId: string }
+    | {
+      type: 'recovery-stage'
+      taskId: string
+      version: 2
+      stage: 'etm-inspection'
+      status: 'started' | 'completed'
+      bindingCount?: number
+    }
+    | {
+      type: 'recovery-stage'
+      taskId: string
+      version: 2
+      stage: 'historical-group-discovery'
+      status: 'started' | 'completed'
+      historicalGroupCount?: number
+      groupCount?: number
+    }
+    | {
+      type: 'group-start'
+      taskId: string
+      version: 2
+      topicChatId: string
+      sourceChatId: string
+      source: 'topic-assoc' | 'msglog-history'
+      bindingCount: number
+    }
+    | {
+      type: 'group-acquisition-progress'
+      taskId: string
+      version: 2
+      topicChatId: string
+      sourceChatId: string
+      acquired: number
+    }
+    | {
+      type: 'group-acquisition-heartbeat'
+      taskId: string
+      version: 2
+      topicChatId: string
+      sourceChatId: string
+      acquired: number
+      elapsedMs: number
+      idleMs: number
+    }
     | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, examined: number }
+    | {
+      type: 'topic-binding-discovery'
+      taskId: string
+      version: 2
+      topicChatId: string
+      messageThreadId: string
+      status: 'started'
+    }
+    | {
+      type: 'topic-binding-discovery'
+      taskId: string
+      version: 2
+      topicChatId: string
+      messageThreadId: string
+      status: 'completed'
+      anchorsExamined: number
+      outcome: 'resolved' | 'conflict' | 'not-found'
+      slaveUid?: string
+      slaveUids?: string[]
+    }
+    | {
+      type: 'topic-binding-discovery-heartbeat'
+      taskId: string
+      version: 2
+      topicChatId: string
+      messageThreadId: string
+      anchorsChecked: number
+      elapsedMs: number
+      idleMs: number
+    }
     | {
       type: 'topic-binding'
       taskId: string

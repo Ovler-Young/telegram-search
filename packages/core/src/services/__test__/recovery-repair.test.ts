@@ -615,6 +615,22 @@ describe('bounded recovery repair', () => {
       takeout: true,
     }))
     const summaries = updates.filter(update => update.type === 'slave-summary')
+    expect(updates.slice(0, 6).map(update => update.type === 'recovery-stage'
+      ? `${update.type}:${update.stage}:${update.status}`
+      : update.type)).toEqual([
+      'started',
+      'recovery-stage:etm-inspection:started',
+      'recovery-stage:etm-inspection:completed',
+      'recovery-stage:historical-group-discovery:started',
+      'recovery-stage:historical-group-discovery:completed',
+      'group-start',
+    ])
+    expect(updates[5]).toMatchObject({
+      topicChatId: '-1000000000042',
+      sourceChatId: '42',
+      source: 'topic-assoc',
+      bindingCount: 3,
+    })
     expect(summaries).toMatchObject([
       {
         type: 'slave-summary',
@@ -683,8 +699,8 @@ describe('bounded recovery repair', () => {
 
     const report = await readFile(output, 'utf8')
     const reportLines = report.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'slave-summary', 'slave-summary', 'group-complete', 'run-complete'])
-    expect(reportLines[3]).toMatchObject({
+    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'group-start', 'slave-summary', 'slave-summary', 'group-complete', 'run-complete'])
+    expect(reportLines[4]).toMatchObject({
       type: 'group-complete',
       slaveCount: 2,
       mappedExamined: 7,
@@ -699,6 +715,146 @@ describe('bounded recovery repair', () => {
     expect(report).not.toContain('alpha inserted body')
     expect(report).not.toContain('beta inserted body')
     expect(report).not.toContain('alpha human body')
+  })
+
+  it('reports bounded acquisition counts without changing completed-group progress semantics', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const output = join(directory, 'report.jsonl')
+    const binding = normalizeBindings([
+      { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+    ])[0]
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Large',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: () => ({ getEntity: vi.fn(async () => group) }) } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: {
+        async* takeoutMessages() {
+          for (let id = 1; id <= 10_001; id++) {
+            yield new Api.Message({
+              id,
+              peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+              date: fromSeconds + id,
+              message: '',
+              replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+            })
+          }
+        },
+      },
+      inspect: vi.fn(async () => ({ bindings: [binding] })),
+      presences: vi.fn(async () => new Map()),
+      insert: vi.fn(async () => ({ inserted: 0, concurrent: 0, conflicts: 0, errors: 0, statuses: new Map() })),
+    })
+
+    const updates = await collectUpdates(service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: (fromSeconds + 20_000) * 1000,
+      chunkSize: 10,
+      outputFile: output,
+      takeout: true,
+    }))
+
+    expect(updates.filter(update => update.type === 'group-acquisition-progress')).toEqual([
+      expect.objectContaining({ acquired: 10_000, topicChatId: '-1000000000042', sourceChatId: '42' }),
+    ])
+    expect(updates.filter(update => update.type === 'progress')).toEqual([
+      expect.objectContaining({ examined: 10_001 }),
+    ])
+    const report = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(report.filter(event => event.type === 'group-acquisition-progress')).toEqual([
+      expect.objectContaining({ acquired: 10_000, topicChatId: '-1000000000042', sourceChatId: '42' }),
+    ])
+  })
+
+  it('emits acquisition heartbeats while awaiting one Telegram iterator request', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    try {
+      const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+      const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+      temporaryDirectories.push(directory)
+      const output = join(directory, 'report.jsonl')
+      const binding = normalizeBindings([
+        { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+      ])[0]
+      const group = new Api.Channel({
+        id: bigInt(42),
+        accessHash: bigInt(1),
+        title: 'Delayed',
+        photo: new Api.ChatPhotoEmpty(),
+        date: 0,
+        megagroup: true,
+      })
+      const delayed = (async function* () {
+        await new Promise(resolve => setTimeout(resolve, 90_000))
+        yield new Api.Message({
+          id: 500,
+          peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+          date: fromSeconds + 1,
+          message: '',
+          replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+        })
+      })()
+      const telegramNext = vi.spyOn(delayed, 'next')
+      const service = createRecoveryRepairService({
+        context: { emitter: new EventEmitter(), getClient: () => ({ getEntity: vi.fn(async () => group) }) } as unknown as CoreContext,
+        logger: logger(),
+        entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+        takeoutService: { takeoutMessages: vi.fn(() => delayed) },
+        inspect: vi.fn(async () => ({ bindings: [binding] })),
+        presences: vi.fn(async () => new Map()),
+        insert: vi.fn(async () => ({ inserted: 0, concurrent: 0, conflicts: 0, errors: 0, statuses: new Map() })),
+      })
+      const stream = service({
+        etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
+        startedAtMs: (fromSeconds + 10) * 1000,
+        chunkSize: 10,
+        outputFile: output,
+        takeout: true,
+      })
+      for (let index = 0; index < 6; index++)
+        await stream.next()
+
+      const pendingHeartbeat = stream.next()
+      while (telegramNext.mock.calls.length === 0)
+        await new Promise(resolve => setImmediate(resolve))
+      await vi.advanceTimersByTimeAsync(60_000)
+      await expect(pendingHeartbeat).resolves.toMatchObject({
+        value: {
+          type: 'group-acquisition-heartbeat',
+          acquired: 0,
+          elapsedMs: 60_000,
+          idleMs: 60_000,
+        },
+      })
+      expect(telegramNext).toHaveBeenCalledOnce()
+
+      const pendingCompletion = stream.next()
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      await pendingCompletion
+      expect(telegramNext).toHaveBeenCalledTimes(2)
+      let done = false
+      while (!done)
+        done = (await stream.next()).done === true
+      const report = await readFile(output, 'utf8')
+      expect(report).toContain('"type":"group-acquisition-heartbeat"')
+    }
+    finally {
+      vi.useRealTimers()
+    }
   })
 
   it('repairs an unassociated historical topic after paging past the first ten reverse-lookup anchors', async () => {
@@ -794,11 +950,22 @@ describe('bounded recovery repair', () => {
       source: 'msglog-history',
     }))
     expect(updates).toContainEqual(expect.objectContaining({
+      type: 'topic-binding-discovery',
+      status: 'completed',
+      messageThreadId: '77',
+      anchorsExamined: 11,
+      outcome: 'resolved',
+    }))
+    expect(updates).toContainEqual(expect.objectContaining({
       type: 'slave-summary',
       slaveName: 'Historical Alpha',
       counts: expect.objectContaining({ inserted: 1, mappedExamined: 1 }),
     }))
     const report = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(report.filter(event => event.type === 'topic-binding-discovery')).toEqual([
+      expect.objectContaining({ status: 'started', messageThreadId: '77' }),
+      expect.objectContaining({ status: 'completed', anchorsExamined: 11, outcome: 'resolved' }),
+    ])
     expect(report).toContainEqual(expect.objectContaining({
       type: 'topic-binding',
       source: 'msglog-history',
@@ -809,7 +976,171 @@ describe('bounded recovery repair', () => {
     expect(takeoutMessages).toHaveBeenCalledTimes(2)
   })
 
-  it('keeps TopicAssoc authoritative and detects historical ambiguity across anchor batches', async () => {
+  it('stops historical topic discovery after the first unique anchor batch', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Historical',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const reverseLookup = vi.fn(async (_source: unknown, identities: string[]) => identities.includes('-1000000000042.1')
+      ? new Map([['-1000000000042.1', ['slave.module chat-a']]])
+      : new Map())
+    let yieldedAnchors = 0
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: () => ({ getEntity: vi.fn(async () => group) }) } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: {
+        async* takeoutMessages(_chatId, options) {
+          if (options.replyTo === 77) {
+            for (let id = 1; id <= 20; id++) {
+              yieldedAnchors += 1
+              yield new Api.Message({ id, peerId: new Api.PeerChannel({ channelId: bigInt(42) }), date: fromSeconds - 100 + id, message: 'anchor' })
+            }
+            return
+          }
+          yield new Api.Message({
+            id: 500,
+            peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+            fromId: new Api.PeerUser({ userId: bigInt(9) }),
+            date: fromSeconds + 1,
+            message: 'body',
+            replyTo: new Api.MessageReplyHeader({ replyToTopId: 77, replyToMsgId: 77 }),
+          })
+        },
+      },
+      inspect: vi.fn(async () => ({ bindings: [] })),
+      historicalGroups: vi.fn(async () => ['-1000000000042']),
+      historicalBindingHits: reverseLookup,
+      slaveDisplayNames: vi.fn(async () => new Map()),
+      presences: vi.fn(async () => new Map()),
+      insert: vi.fn(async (_source: unknown, candidates: RepairCandidate[]) => ({
+        inserted: candidates.length,
+        concurrent: 0,
+        conflicts: 0,
+        errors: 0,
+        statuses: new Map(candidates.map(candidate => [candidate.identity, 'inserted' as const])),
+      })),
+    })
+
+    const updates = await collectUpdates(service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: (fromSeconds + 10) * 1000,
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    }))
+
+    expect(reverseLookup).toHaveBeenCalledOnce()
+    expect(yieldedAnchors).toBe(10)
+    expect(updates).toContainEqual(expect.objectContaining({
+      type: 'topic-binding-discovery',
+      status: 'completed',
+      anchorsExamined: 10,
+      outcome: 'resolved',
+      slaveUid: 'slave.module chat-a',
+    }))
+  })
+
+  it('emits topic discovery heartbeats while awaiting one anchor iterator request', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    try {
+      const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+      const group = new Api.Channel({
+        id: bigInt(42),
+        accessHash: bigInt(1),
+        title: 'Historical',
+        photo: new Api.ChatPhotoEmpty(),
+        date: 0,
+        megagroup: true,
+      })
+      const delayedAnchors = (async function* () {
+        await new Promise(resolve => setTimeout(resolve, 90_000))
+        yield new Api.Message({ id: 1, peerId: new Api.PeerChannel({ channelId: bigInt(42) }), date: fromSeconds - 1, message: 'anchor' })
+      })()
+      const anchorNext = vi.spyOn(delayedAnchors, 'next')
+      const service = createRecoveryRepairService({
+        context: { emitter: new EventEmitter(), getClient: () => ({ getEntity: vi.fn(async () => group) }) } as unknown as CoreContext,
+        logger: logger(),
+        entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+        takeoutService: {
+          takeoutMessages: vi.fn((_chatId, options) => options.replyTo === 77
+            ? delayedAnchors
+            : (async function* () {
+                yield new Api.Message({
+                  id: 500,
+                  peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+                  fromId: new Api.PeerUser({ userId: bigInt(9) }),
+                  date: fromSeconds + 1,
+                  message: 'body',
+                  replyTo: new Api.MessageReplyHeader({ replyToTopId: 77, replyToMsgId: 77 }),
+                })
+              })()),
+        },
+        inspect: vi.fn(async () => ({ bindings: [] })),
+        historicalGroups: vi.fn(async () => ['-1000000000042']),
+        historicalBindingHits: vi.fn(async () => new Map([['-1000000000042.1', ['slave.module chat-a']]])),
+        slaveDisplayNames: vi.fn(async () => new Map()),
+        presences: vi.fn(async () => new Map()),
+        insert: vi.fn(async (_source: unknown, candidates: RepairCandidate[]) => ({
+          inserted: candidates.length,
+          concurrent: 0,
+          conflicts: 0,
+          errors: 0,
+          statuses: new Map(candidates.map(candidate => [candidate.identity, 'inserted' as const])),
+        })),
+      })
+      const stream = service({
+        etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
+        startedAtMs: (fromSeconds + 10) * 1000,
+        chunkSize: 10,
+        outputFile: null,
+        takeout: true,
+      })
+      let update = await stream.next()
+      while (!update.done && update.value.type !== 'topic-binding-discovery')
+        update = await stream.next()
+      expect(update.value).toMatchObject({ type: 'topic-binding-discovery', status: 'started', messageThreadId: '77' })
+
+      const pendingHeartbeat = stream.next()
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(60_000)
+      await expect(pendingHeartbeat).resolves.toMatchObject({
+        value: {
+          type: 'topic-binding-discovery-heartbeat',
+          messageThreadId: '77',
+          anchorsChecked: 0,
+          elapsedMs: 60_000,
+          idleMs: 60_000,
+        },
+      })
+      expect(anchorNext).toHaveBeenCalledOnce()
+
+      const pendingResult = stream.next()
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      await expect(pendingResult).resolves.toMatchObject({
+        value: { type: 'topic-binding-discovery', status: 'completed', outcome: 'resolved', anchorsExamined: 1 },
+      })
+      expect(anchorNext).toHaveBeenCalledTimes(2)
+      let done = false
+      while (!done)
+        done = (await stream.next()).done === true
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps TopicAssoc authoritative and detects historical ambiguity in one anchor batch', async () => {
     const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
     const group = new Api.Channel({
       id: bigInt(42),
@@ -823,10 +1154,12 @@ describe('bounded recovery repair', () => {
       { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module current' },
     ])[0]
     const reverseLookup = vi.fn(async (_source: unknown, identities: string[]) => {
-      if (identities.includes('-1000000000042.1'))
-        return new Map([['-1000000000042.1', ['slave.module old-a']]])
-      if (identities.includes('-1000000000042.11'))
-        return new Map([['-1000000000042.11', ['slave.module old-b']]])
+      if (identities.includes('-1000000000042.1')) {
+        return new Map([
+          ['-1000000000042.1', ['slave.module old-a']],
+          ['-1000000000042.2', ['slave.module old-b']],
+        ])
+      }
       return new Map()
     })
     const insert = vi.fn(async (_source: unknown, candidates: RepairCandidate[]) => ({
@@ -882,10 +1215,17 @@ describe('bounded recovery repair', () => {
       [expect.objectContaining({ identity: '-1000000000042.500', binding })],
       10,
     )
-    expect(reverseLookup).toHaveBeenCalledTimes(2)
+    expect(reverseLookup).toHaveBeenCalledOnce()
     expect(updates).toContainEqual(expect.objectContaining({
       type: 'topic-binding-conflict',
       messageThreadId: '77',
+      slaveUids: ['slave.module old-a', 'slave.module old-b'],
+    }))
+    expect(updates).toContainEqual(expect.objectContaining({
+      type: 'topic-binding-discovery',
+      status: 'completed',
+      anchorsExamined: 10,
+      outcome: 'conflict',
       slaveUids: ['slave.module old-a', 'slave.module old-b'],
     }))
     expect(updates.at(-1)).toMatchObject({ summary: { counts: { 'inserted': 1, 'unbound-topic': 1 } } })
@@ -974,10 +1314,11 @@ describe('bounded recovery repair', () => {
     }
 
     const reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(reportLines).toHaveLength(6)
+    expect(reportLines).toHaveLength(8)
     expect(reportLines[0]).toEqual({ type: 'prior-run' })
     expect(reportLines[1]).toMatchObject({ type: 'run-start', version: 2, groups: ['-1000000000043', '-1000000000042'] })
-    expect(reportLines[2]).toMatchObject({
+    expect(reportLines[2]).toMatchObject({ type: 'group-start', topicChatId: '-1000000000043' })
+    expect(reportLines[3]).toMatchObject({
       type: 'group-unavailable',
       version: 2,
       topicChatId: '-1000000000043',
@@ -992,13 +1333,14 @@ describe('bounded recovery repair', () => {
       }],
       totalCounts: expect.objectContaining({ 'unavailable-bound-group': 1 }),
     })
-    expect(reportLines[3]).toMatchObject({
+    expect(reportLines[4]).toMatchObject({ type: 'group-start', topicChatId: '-1000000000042' })
+    expect(reportLines[5]).toMatchObject({
       type: 'slave-summary',
       topicChatId: '-1000000000042',
       slaveUid: 'slave.module chat-a',
       counts: expect.objectContaining({ inserted: 1, mappedExamined: 1 }),
     })
-    expect(reportLines[4]).toMatchObject({
+    expect(reportLines[6]).toMatchObject({
       type: 'group-complete',
       version: 2,
       topicChatId: '-1000000000042',
@@ -1011,7 +1353,7 @@ describe('bounded recovery repair', () => {
         status: 'repair-attempted',
       })],
     })
-    expect(reportLines[5]).toMatchObject({
+    expect(reportLines[7]).toMatchObject({
       type: 'run-complete',
       version: 2,
       summary: {
@@ -1247,18 +1589,18 @@ describe('bounded recovery repair', () => {
       check.close()
     }
     let reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'slave-summary', 'group-complete', 'run-failed'])
-    expect(reportLines[1]).toMatchObject({
+    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'group-start', 'slave-summary', 'group-complete', 'group-start', 'run-failed'])
+    expect(reportLines[2]).toMatchObject({
       type: 'slave-summary',
       topicChatId: '-1000000000043',
       slaveUid: 'slave.module chat-a',
       counts: expect.objectContaining({ inserted: 1, mappedExamined: 1 }),
     })
-    expect(reportLines[2]).toMatchObject({
+    expect(reportLines[3]).toMatchObject({
       topicChatId: '-1000000000043',
       counts: expect.objectContaining({ inserted: 1 }),
     })
-    expect(reportLines[3]).toMatchObject({
+    expect(reportLines[5]).toMatchObject({
       type: 'run-failed',
       category: 'telegram-internal',
       totalCounts: expect.objectContaining({ inserted: 1 }),
@@ -1301,18 +1643,23 @@ describe('bounded recovery repair', () => {
     reportLines = report.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
     expect(reportLines.map(line => line.type)).toEqual([
       'run-start',
+      'group-start',
       'slave-summary',
       'group-complete',
+      'group-start',
       'run-failed',
       'run-start',
+      'group-start',
       'slave-summary',
       'group-complete',
+      'group-start',
       'group-unavailable',
+      'group-start',
       'slave-summary',
       'group-complete',
       'run-complete',
     ])
-    expect(reportLines[7]).toMatchObject({
+    expect(reportLines[11]).toMatchObject({
       type: 'group-unavailable',
       topicChatId: '-1000000000042',
       sourceChatId: '42',
@@ -1372,8 +1719,8 @@ describe('bounded recovery repair', () => {
     }
 
     const report = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(report.map(line => line.type)).toEqual(['run-start', 'group-unavailable', 'run-complete'])
-    expect(report[1]).toMatchObject({
+    expect(report.map(line => line.type)).toEqual(['run-start', 'group-start', 'group-unavailable', 'run-complete'])
+    expect(report[2]).toMatchObject({
       type: 'group-unavailable',
       topicChatId: '-1000000000042',
       sourceChatId: '42',
