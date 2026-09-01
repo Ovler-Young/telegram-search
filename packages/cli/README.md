@@ -250,7 +250,7 @@ wc -l "$RECOVERY_REPORT_DIR/$RECOVERY_REPORT_FILE"
 sed -n '1,20p' "$RECOVERY_REPORT_DIR/$RECOVERY_REPORT_FILE"
 ```
 
-Use the PostgreSQL container name in those commands when that backend was selected. The first JSONL row is the summary described above; later rows contain identifiers and classifications, not message text or credentials. Treat the report as private nonetheless.
+Use the PostgreSQL container name in those commands when that backend was selected. JSONL rows use the run and group event format described above; they contain identifiers and classifications, not message text or credentials. Treat the report as private nonetheless.
 
 Remove stopped one-run containers and the Compose network while retaining the authentication session volume for an idempotent rerun:
 
