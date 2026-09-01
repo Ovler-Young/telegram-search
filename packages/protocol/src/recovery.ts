@@ -36,6 +36,7 @@ export interface RecoveryRepairCounts {
   'present-primary': number
   'present-alt': number
   'inserted': number
+  'unavailable-bound-group': number
   'unbound-topic': number
   'human-or-unconfigured-sender': number
   'service-deleted-unusable': number
