@@ -11,9 +11,7 @@ import type { CoreContext } from '../context'
 import type { EntityService } from './entity'
 import type { TakeoutService } from './takeout'
 
-import process from 'node:process'
-
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open } from 'node:fs/promises'
 import { basename, dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -78,6 +76,23 @@ export interface AcquiredMessage {
   text: string
   topicId?: string
 }
+
+type UnavailableBoundGroupCategory
+  = | 'missing-input-entity'
+    | 'channel-invalid'
+    | 'channel-private'
+    | 'channel-public-group-na'
+    | 'chat-id-invalid'
+    | 'peer-id-invalid'
+    | 'user-not-participant'
+
+interface UnavailableBoundGroup {
+  topicChatId: string
+  sourceChatId: string
+  category: UnavailableBoundGroupCategory
+}
+
+type ReportCandidateStatus = 'present-primary' | 'present-alt' | 'repair-attempted'
 
 type EtmSource = RecoveryRepairInput['etm']
 type Presence = 'primary' | 'alternate' | 'missing'
@@ -241,6 +256,43 @@ function rawPeerId(peer: Api.TypePeer): string | undefined {
     return peer.channelId.toString()
 }
 
+function assertGroupInputPeer(group: ReturnType<typeof parseEtmGroupId>, inputPeer: Api.TypeInputPeer) {
+  if (group.expectedPeer === 'channel') {
+    if (!(inputPeer instanceof Api.InputPeerChannel) || inputPeer.channelId.toString() !== group.sourceChatId)
+      throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected supergroup input peer`)
+    return
+  }
+  if (!(inputPeer instanceof Api.InputPeerChat) || inputPeer.chatId.toString() !== group.sourceChatId)
+    throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected basic group input peer`)
+}
+
+const UNAVAILABLE_RPC_ERRORS = new Map<string, UnavailableBoundGroupCategory>([
+  ['CHANNEL_INVALID', 'channel-invalid'],
+  ['CHANNEL_PRIVATE', 'channel-private'],
+  ['CHANNEL_PUBLIC_GROUP_NA', 'channel-public-group-na'],
+  ['CHAT_ID_INVALID', 'chat-id-invalid'],
+  ['PEER_ID_INVALID', 'peer-id-invalid'],
+  ['USER_NOT_PARTICIPANT', 'user-not-participant'],
+])
+
+function classifyUnavailableBoundGroup(error: unknown): UnavailableBoundGroupCategory | undefined {
+  const message = error instanceof Error ? error.message : String(error)
+  if (
+    message.startsWith('Could not find the input entity for ')
+    || message.startsWith('Cannot find any entity corresponding to ')
+  ) {
+    return 'missing-input-entity'
+  }
+
+  const rpcMessage = typeof error === 'object' && error && 'errorMessage' in error
+    ? String((error as { errorMessage?: unknown }).errorMessage)
+    : undefined
+  if (!rpcMessage)
+    return undefined
+
+  return UNAVAILABLE_RPC_ERRORS.get(rpcMessage)
+}
+
 function compareMessages(a: AcquiredMessage, b: AcquiredMessage): number {
   const chat = BigInt(a.topicChatId) - BigInt(b.topicChatId)
   if (chat !== 0n)
@@ -367,10 +419,10 @@ function insertSqliteChunk(path: string, chunk: RepairCandidate[]): InsertOutcom
     transaction = false
     return { inserted, concurrent, conflicts, errors: 0 }
   }
-  catch {
+  catch (error) {
     if (transaction)
       database.exec('ROLLBACK')
-    return { inserted: 0, concurrent: 0, conflicts: 0, errors: chunk.length }
+    throw error
   }
   finally {
     database.close()
@@ -401,9 +453,9 @@ async function insertPostgresChunk(source: Extract<EtmSource, { backend: 'postgr
     await client.query('COMMIT')
     return { inserted, concurrent, conflicts, errors: 0 }
   }
-  catch {
+  catch (error) {
     await client.query('ROLLBACK').catch(() => {})
-    return { inserted: 0, concurrent: 0, conflicts: 0, errors: chunk.length }
+    throw error
   }
   finally {
     client.release()
@@ -426,52 +478,147 @@ export async function insertRepairCandidates(source: EtmSource, candidates: Repa
   return total
 }
 
-async function writeReport(
-  path: string,
-  summary: RecoveryRepairSummary,
-  candidates: RepairCandidate[],
-  presences: Map<string, Presence>,
-) {
-  const records = [
-    { type: 'repair-summary', ...summary },
-    ...candidates.map(candidate => ({
-      type: 'repair-message',
-      version: 1,
-      identity: candidate.identity,
-      topicChatId: candidate.topicChatId,
-      messageId: candidate.messageId,
-      senderBotId: candidate.senderBotId,
-      topicId: candidate.binding.messageThreadId,
-      status: presences.get(candidate.identity) === 'primary'
-        ? 'present-primary'
-        : presences.get(candidate.identity) === 'alternate'
-          ? 'present-alt'
-          : 'repair-attempted',
-    })),
-  ]
-  const temporaryPath = `${path}.${process.pid}.tmp`
-  try {
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(temporaryPath, `${records.map(row => JSON.stringify(row)).join('\n')}\n`, { mode: 0o600 })
-    await rename(temporaryPath, path)
-  }
-  catch (error) {
-    await rm(temporaryPath, { force: true })
-    throw error
-  }
-}
-
 function emptyCounts(): RecoveryRepairCounts {
   return {
     'present-primary': 0,
     'present-alt': 0,
     'inserted': 0,
+    'unavailable-bound-group': 0,
     'unbound-topic': 0,
     'human-or-unconfigured-sender': 0,
     'service-deleted-unusable': 0,
     'concurrent': 0,
     'conflicts': 0,
     'errors': 0,
+  }
+}
+
+function addCounts(total: RecoveryRepairCounts, next: RecoveryRepairCounts) {
+  for (const key of Object.keys(total) as Array<keyof RecoveryRepairCounts>)
+    total[key] += next[key]
+}
+
+function bindingsForGroup(bindings: TopicBinding[], topicChatId: string): TopicBinding[] {
+  return bindings.filter(binding => binding.topicChatId === topicChatId).sort(compareBindings)
+}
+
+function candidateStatus(candidate: RepairCandidate, presences: Map<string, Presence>): ReportCandidateStatus {
+  const presence = presences.get(candidate.identity)
+  if (presence === 'primary')
+    return 'present-primary'
+  if (presence === 'alternate')
+    return 'present-alt'
+  return 'repair-attempted'
+}
+
+function buildGroupCandidates(
+  messages: Iterable<AcquiredMessage>,
+  bindings: Map<string, TopicBinding>,
+  roles: Map<string, string | null>,
+): { candidates: RepairCandidate[], counts: RecoveryRepairCounts } {
+  const counts = emptyCounts()
+  const candidates: RepairCandidate[] = []
+  for (const message of [...messages].sort(compareMessages)) {
+    if (!message.senderId || !message.topicId || !message.text.trim()) {
+      counts['service-deleted-unusable'] += 1
+      continue
+    }
+    const binding = bindings.get(`${message.topicChatId}.${message.topicId}`)
+    if (!binding) {
+      counts['unbound-topic'] += 1
+      continue
+    }
+    if (!roles.has(message.senderId)) {
+      counts['human-or-unconfigured-sender'] += 1
+      continue
+    }
+    candidates.push({
+      identity: `${message.topicChatId}.${message.messageId}`,
+      topicChatId: message.topicChatId,
+      messageId: message.messageId,
+      senderId: message.senderId,
+      senderBotId: roles.get(message.senderId) ?? null,
+      timestamp: message.timestamp,
+      text: message.text,
+      binding,
+    })
+  }
+  return { candidates, counts }
+}
+
+function splitCandidatesByPresence(candidates: RepairCandidate[], presences: Map<string, Presence>, counts: RecoveryRepairCounts): RepairCandidate[] {
+  const missing: RepairCandidate[] = []
+  for (const candidate of candidates) {
+    const presence = presences.get(candidate.identity) ?? 'missing'
+    if (presence === 'primary')
+      counts['present-primary'] += 1
+    else if (presence === 'alternate')
+      counts['present-alt'] += 1
+    else
+      missing.push(candidate)
+  }
+  return missing
+}
+
+function applyInsertOutcome(counts: RecoveryRepairCounts, outcome: InsertOutcome) {
+  counts.inserted = outcome.inserted
+  counts.concurrent = outcome.concurrent
+  counts.conflicts = outcome.conflicts
+  counts.errors = outcome.errors
+}
+
+function reportCandidate(candidate: RepairCandidate, presences: Map<string, Presence>) {
+  return {
+    identity: candidate.identity,
+    topicChatId: candidate.topicChatId,
+    messageId: candidate.messageId,
+    senderBotId: candidate.senderBotId,
+    topicId: candidate.binding.messageThreadId,
+    status: candidateStatus(candidate, presences),
+  }
+}
+
+async function appendReportEvent(path: string, event: Record<string, unknown>) {
+  await mkdir(dirname(path), { recursive: true })
+  const file = await open(path, 'a', 0o600)
+  try {
+    await file.chmod(0o600)
+    await file.writeFile(`${JSON.stringify(event)}\n`)
+    await file.sync()
+  }
+  finally {
+    await file.close()
+  }
+}
+
+function safeFailureCategory(error: unknown): string {
+  if (error instanceof DOMException && error.name === 'AbortError')
+    return 'aborted'
+  const rpcMessage = typeof error === 'object' && error && 'errorMessage' in error
+    ? String((error as { errorMessage?: unknown }).errorMessage)
+    : undefined
+  if (rpcMessage && /^[A-Z][A-Z0-9_]*$/.test(rpcMessage))
+    return `telegram-${rpcMessage.toLowerCase().replaceAll('_', '-')}`
+  return error instanceof Error && error.name ? error.name : 'error'
+}
+
+function buildSummary(
+  input: RecoveryRepairInput,
+  toMs: number,
+  groups: Array<ReturnType<typeof parseEtmGroupId>>,
+  roles: Map<string, string | null>,
+  counts: RecoveryRepairCounts,
+  examined: number,
+): RecoveryRepairSummary {
+  return {
+    version: 1,
+    backend: input.etm.backend,
+    window: { from: RECOVERY_REPAIR_FROM_ISO, to: new Date(toMs).toISOString(), semantics: '[from,to)' },
+    groups: groups.map(group => group.topicChatId),
+    mainBotIds: [...roles].filter(([, role]) => role === null).map(([id]) => id).sort(),
+    auxiliaryBotIds: [...roles].filter(([, role]) => role !== null).map(([id]) => id).sort(),
+    counts,
+    examined,
   }
 }
 
@@ -497,129 +644,163 @@ export function createRecoveryRepairService(options: {
     const taskId = uuidv4()
     yield { type: 'started', taskId }
     const roles = configuredSenderRoles(input.mainBotId, input.auxiliaryBotIds)
-
+    const counts = emptyCounts()
+    let examined = 0
+    let reportStarted = false
     const before = await inspector(input.etm)
     const groups = [...new Set(before.bindings.map(binding => binding.topicChatId))]
       .map(parseEtmGroupId)
       .sort((a, b) => BigInt(a.topicChatId) < BigInt(b.topicChatId) ? -1 : 1)
-    const messages = new Map<string, AcquiredMessage>()
-    const counts = emptyCounts()
 
-    for (const group of groups) {
-      if (signal?.aborted)
-        throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
-      const inputPeer = await entityService.getInputPeer(group.topicChatId)
-      const entity = await context.getClient().getEntity(inputPeer)
-      if (group.expectedPeer === 'channel' && (!(entity instanceof Api.Channel) || !entity.megagroup || entity.id.toString() !== group.sourceChatId))
-        throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected supergroup`)
-      if (group.expectedPeer === 'chat' && (!(entity instanceof Api.Chat) || entity.id.toString() !== group.sourceChatId))
-        throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected basic group`)
+    try {
+      if (input.outputFile) {
+        await appendReportEvent(input.outputFile, {
+          type: 'run-start',
+          version: 2,
+          runId: taskId,
+          backend: input.etm.backend,
+          window: { from: RECOVERY_REPAIR_FROM_ISO, to: new Date(toMs).toISOString(), semantics: '[from,to)' },
+          groups: groups.map(group => group.topicChatId),
+          mainBotIds: [...roles].filter(([, role]) => role === null).map(([id]) => id).sort(),
+          auxiliaryBotIds: [...roles].filter(([, role]) => role !== null).map(([id]) => id).sort(),
+        })
+        reportStarted = true
+      }
 
-      const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
-      const abortTask = () => task.abort()
-      signal?.addEventListener('abort', abortTask, { once: true })
-      try {
-        for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
-          pagination: { limit: 100, offset: 0 },
-          inputPeer,
-          startTime: fromMs,
-          endTime: toMs - 1,
-          skipMedia: true,
-          expectedCount: 0,
-          disableAutoProgress: true,
-          takeoutConsent: input.takeout,
-          task,
-        })) {
-          const timestamp = message.date * 1000
-          if (timestamp < fromMs || timestamp >= toMs)
-            continue
-          if (rawPeerId(message.peerId) !== group.sourceChatId)
-            throw new Error(`Telegram returned message ${message.id} from an unexpected group`)
-          const messageId = message.id.toString()
-          const senderId = message.fromId ? rawPeerId(message.fromId) : undefined
-          const topicId = message.replyTo instanceof Api.MessageReplyHeader
-            ? (message.replyTo.replyToTopId ?? message.replyTo.replyToMsgId)?.toString()
-            : undefined
-          messages.set(`${group.topicChatId}.${messageId}`, {
+      for (const group of groups) {
+        if (signal?.aborted)
+          throw signal.reason instanceof Error ? signal.reason : new DOMException('Recovery repair aborted', 'AbortError')
+        const groupMessages = new Map<string, AcquiredMessage>()
+        const task = createTask('takeout', { chatIds: [group.sourceChatId] }, context.emitter, logger)
+        const abortTask = () => task.abort()
+        signal?.addEventListener('abort', abortTask, { once: true })
+        try {
+          const inputPeer = await entityService.getInputPeer(group.sourceChatId)
+          assertGroupInputPeer(group, inputPeer)
+          const entity = await context.getClient().getEntity(inputPeer)
+          if (group.expectedPeer === 'channel' && (!(entity instanceof Api.Channel) || !entity.megagroup || entity.id.toString() !== group.sourceChatId))
+            throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected supergroup`)
+          if (group.expectedPeer === 'chat' && (!(entity instanceof Api.Chat) || entity.id.toString() !== group.sourceChatId))
+            throw new Error(`ETM group ${group.topicChatId} did not resolve to its expected basic group`)
+
+          for await (const message of takeoutService.takeoutMessages(group.sourceChatId, {
+            pagination: { limit: 100, offset: 0 },
+            inputPeer,
+            startTime: fromMs,
+            endTime: toMs - 1,
+            skipMedia: true,
+            expectedCount: 0,
+            disableAutoProgress: true,
+            takeoutConsent: input.takeout,
+            task,
+          })) {
+            const timestamp = message.date * 1000
+            if (timestamp < fromMs || timestamp >= toMs)
+              continue
+            if (rawPeerId(message.peerId) !== group.sourceChatId)
+              throw new Error(`Telegram returned message ${message.id} from an unexpected group`)
+            const messageId = message.id.toString()
+            const senderId = message.fromId ? rawPeerId(message.fromId) : undefined
+            const topicId = message.replyTo instanceof Api.MessageReplyHeader
+              ? (message.replyTo.replyToTopId ?? message.replyTo.replyToMsgId)?.toString()
+              : undefined
+            groupMessages.set(`${group.topicChatId}.${messageId}`, {
+              topicChatId: group.topicChatId,
+              sourceChatId: group.sourceChatId,
+              messageId,
+              senderId,
+              timestamp: message.date,
+              text: message.message,
+              topicId,
+            })
+          }
+          if (task.state.lastError)
+            throw task.state.rawError ?? new Error(task.state.lastError)
+        }
+        catch (error) {
+          const category = classifyUnavailableBoundGroup(error)
+          if (!category)
+            throw error
+          const unavailableGroup = {
             topicChatId: group.topicChatId,
             sourceChatId: group.sourceChatId,
-            messageId,
-            senderId,
-            timestamp: message.date,
-            text: message.message,
-            topicId,
+            category,
+          } satisfies UnavailableBoundGroup
+          counts['unavailable-bound-group'] += 1
+          logger.withFields(unavailableGroup).warn('Skipping unavailable ETM bound group')
+          if (input.outputFile) {
+            await appendReportEvent(input.outputFile, {
+              type: 'group-unavailable',
+              version: 2,
+              runId: taskId,
+              ...unavailableGroup,
+              totalCounts: counts,
+              totalExamined: examined,
+            })
+          }
+          yield { type: 'progress', taskId, topicChatId: group.topicChatId, sourceChatId: group.sourceChatId, examined }
+          continue
+        }
+        finally {
+          signal?.removeEventListener('abort', abortTask)
+        }
+
+        const afterGroup = await inspector(input.etm)
+        const initialGroupBindings = bindingsForGroup(before.bindings, group.topicChatId)
+        const currentGroupBindings = bindingsForGroup(afterGroup.bindings, group.topicChatId)
+        if (!sameBindings(initialGroupBindings, currentGroupBindings))
+          throw new Error(`ETM TopicAssoc mappings changed for ${group.topicChatId} during Telegram acquisition; repair aborted`)
+
+        const bindings = new Map(currentGroupBindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, binding]))
+        const groupResult = buildGroupCandidates(groupMessages.values(), bindings, roles)
+        const presences = await presenceReader(input.etm, groupResult.candidates.map(candidate => candidate.identity))
+        const missing = splitCandidatesByPresence(groupResult.candidates, presences, groupResult.counts)
+        const outcome = await inserter(input.etm, missing, input.chunkSize)
+        applyInsertOutcome(groupResult.counts, outcome)
+        addCounts(counts, groupResult.counts)
+        examined += groupMessages.size
+
+        if (input.outputFile) {
+          await appendReportEvent(input.outputFile, {
+            type: 'group-complete',
+            version: 2,
+            runId: taskId,
+            topicChatId: group.topicChatId,
+            sourceChatId: group.sourceChatId,
+            counts: groupResult.counts,
+            totalCounts: counts,
+            examined: groupMessages.size,
+            totalExamined: examined,
+            candidates: groupResult.candidates.map(candidate => reportCandidate(candidate, presences)),
           })
         }
-      }
-      finally {
-        signal?.removeEventListener('abort', abortTask)
-      }
-      if (task.state.lastError)
-        throw task.state.rawError ?? new Error(task.state.lastError)
-      yield { type: 'progress', taskId, topicChatId: group.topicChatId, sourceChatId: group.sourceChatId, examined: messages.size }
-    }
 
-    const after = await inspector(input.etm)
-    if (!sameBindings(before.bindings, after.bindings))
-      throw new Error('ETM TopicAssoc mappings changed during Telegram acquisition; repair aborted')
-
-    const bindings = new Map(after.bindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, binding]))
-    const candidates: RepairCandidate[] = []
-    for (const message of [...messages.values()].sort(compareMessages)) {
-      if (!message.senderId || !message.topicId || !message.text.trim()) {
-        counts['service-deleted-unusable'] += 1
-        continue
+        yield { type: 'progress', taskId, topicChatId: group.topicChatId, sourceChatId: group.sourceChatId, examined }
       }
-      const binding = bindings.get(`${message.topicChatId}.${message.topicId}`)
-      if (!binding) {
-        counts['unbound-topic'] += 1
-        continue
-      }
-      if (!roles.has(message.senderId)) {
-        counts['human-or-unconfigured-sender'] += 1
-        continue
-      }
-      candidates.push({
-        identity: `${message.topicChatId}.${message.messageId}`,
-        topicChatId: message.topicChatId,
-        messageId: message.messageId,
-        senderId: message.senderId,
-        senderBotId: roles.get(message.senderId) ?? null,
-        timestamp: message.timestamp,
-        text: message.text,
-        binding,
-      })
-    }
 
-    const presences = await presenceReader(input.etm, candidates.map(candidate => candidate.identity))
-    const missing: RepairCandidate[] = []
-    for (const candidate of candidates) {
-      const presence = presences.get(candidate.identity) ?? 'missing'
-      if (presence === 'primary')
-        counts['present-primary'] += 1
-      else if (presence === 'alternate')
-        counts['present-alt'] += 1
-      else
-        missing.push(candidate)
+      const summary = buildSummary(input, toMs, groups, roles, counts, examined)
+      if (input.outputFile) {
+        await appendReportEvent(input.outputFile, {
+          type: 'run-complete',
+          version: 2,
+          runId: taskId,
+          summary,
+        })
+      }
+      yield { type: 'completed', summary, file: input.outputFile ? basename(input.outputFile) : null }
     }
-
-    const outcome = await inserter(input.etm, missing, input.chunkSize)
-    counts.inserted = outcome.inserted
-    counts.concurrent = outcome.concurrent
-    counts.conflicts = outcome.conflicts
-    counts.errors = outcome.errors
-    const summary: RecoveryRepairSummary = {
-      version: 1,
-      backend: input.etm.backend,
-      window: { from: RECOVERY_REPAIR_FROM_ISO, to: new Date(toMs).toISOString(), semantics: '[from,to)' },
-      groups: groups.map(group => group.topicChatId),
-      mainBotIds: [...roles].filter(([, role]) => role === null).map(([id]) => id).sort(),
-      auxiliaryBotIds: [...roles].filter(([, role]) => role !== null).map(([id]) => id).sort(),
-      counts,
-      examined: messages.size,
+    catch (error) {
+      if (input.outputFile && reportStarted) {
+        await appendReportEvent(input.outputFile, {
+          type: 'run-failed',
+          version: 2,
+          runId: taskId,
+          category: safeFailureCategory(error),
+          totalCounts: counts,
+          totalExamined: examined,
+        }).catch(reportError => logger.withError(reportError).warn('Failed to append recovery failure report'))
+      }
+      throw error
     }
-    if (input.outputFile)
-      await writeReport(input.outputFile, summary, candidates, presences)
-    yield { type: 'completed', summary, file: input.outputFile ? basename(input.outputFile) : null }
   }
 }

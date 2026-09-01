@@ -6,7 +6,7 @@ import type { TakeoutService } from '../takeout'
 import process from 'node:process'
 
 import { Buffer } from 'node:buffer'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -80,6 +80,13 @@ afterEach(async () => {
   vi.restoreAllMocks()
   await Promise.all(temporaryDirectories.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
+
+async function collectUpdates<T>(generator: AsyncGenerator<T>): Promise<T[]> {
+  const updates = []
+  for await (const update of generator)
+    updates.push(update)
+  return updates
+}
 
 describe('eTM discovery and bot identity', () => {
   it('normalizes marked group IDs and rejects conflicting or unusable bindings', () => {
@@ -257,12 +264,7 @@ describe('bounded recovery repair', () => {
       takeout: true,
     }
 
-    const run = async () => {
-      const updates = []
-      for await (const update of service(input)) updates.push(update)
-      return updates.at(-1)
-    }
-    const first = await run()
+    const first = (await collectUpdates(service(input))).at(-1)
     expect(first).toMatchObject({
       type: 'completed',
       summary: {
@@ -326,8 +328,391 @@ describe('bounded recovery repair', () => {
       },
     ])
 
-    const second = await run()
+    const second = (await collectUpdates(service(input))).at(-1)
     expect(second).toMatchObject({ summary: { counts: { 'present-primary': 3, 'present-alt': 1, 'inserted': 0 } } })
+  })
+
+  it('skips a stale bound group while importing accessible messages and reporting safe metadata', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const toMs = (fromSeconds + 200) * 1000
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'etm.db')
+    const output = join(directory, 'report.jsonl')
+    const database = createEtmDatabase(path)
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(1, '-1000000000042', '10', 'slave.module chat-a')
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(2, '-1000000000043', '10', 'slave.module chat-b')
+    database.close()
+    await writeFile(output, '{"type":"prior-run"}\n', { mode: 0o644 })
+    await chmod(output, 0o644)
+
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Bound',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const client = { getEntity: vi.fn(async () => group) }
+    const getInputPeer = vi.fn(async (chatId: string | number) => {
+      if (String(chatId) === '42')
+        return new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })
+      throw new Error('Could not find the input entity for {"channelId":"43","className":"PeerChannel"}')
+    })
+    const takeoutMessages = vi.fn(async function* () {
+      yield new Api.Message({
+        id: 150,
+        peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+        fromId: new Api.PeerUser({ userId: bigInt(9) }),
+        date: fromSeconds + 1,
+        message: 'imported private body',
+        replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+      })
+    })
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: () => client } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer },
+      takeoutService: { takeoutMessages },
+    })
+    const input = {
+      etm: { backend: 'sqlite' as const, path },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: toMs,
+      chunkSize: 10,
+      outputFile: output,
+      takeout: true,
+    }
+
+    const first = (await collectUpdates(service(input))).at(-1)
+    expect(getInputPeer).toHaveBeenCalledWith('42')
+    expect(getInputPeer).toHaveBeenCalledWith('43')
+    expect(takeoutMessages).toHaveBeenCalledTimes(1)
+    expect(first).toMatchObject({
+      type: 'completed',
+      summary: {
+        counts: {
+          'inserted': 1,
+          'unavailable-bound-group': 1,
+          'errors': 0,
+        },
+        examined: 1,
+      },
+    })
+
+    const check = new DatabaseSync(path, { readOnly: true })
+    try {
+      expect(check.prepare('SELECT master_msg_id, text FROM msglog ORDER BY master_msg_id').all()).toEqual([{
+        master_msg_id: '-1000000000042.150',
+        text: 'imported private body',
+      }])
+      expect(check.prepare('SELECT COUNT(*) AS count FROM msglog WHERE master_msg_id LIKE ?').get('-1000000000043.%')).toEqual({ count: 0 })
+    }
+    finally {
+      check.close()
+    }
+
+    const reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(reportLines).toHaveLength(5)
+    expect(reportLines[0]).toEqual({ type: 'prior-run' })
+    expect(reportLines[1]).toMatchObject({ type: 'run-start', version: 2, groups: ['-1000000000043', '-1000000000042'] })
+    expect(reportLines[2]).toMatchObject({
+      type: 'group-unavailable',
+      version: 2,
+      topicChatId: '-1000000000043',
+      sourceChatId: '43',
+      category: 'missing-input-entity',
+      totalCounts: expect.objectContaining({ 'unavailable-bound-group': 1 }),
+    })
+    expect(reportLines[3]).toMatchObject({
+      type: 'group-complete',
+      version: 2,
+      topicChatId: '-1000000000042',
+      sourceChatId: '42',
+      counts: expect.objectContaining({ inserted: 1 }),
+      candidates: [expect.objectContaining({
+        identity: '-1000000000042.150',
+        status: 'repair-attempted',
+      })],
+    })
+    expect(reportLines[4]).toMatchObject({
+      type: 'run-complete',
+      version: 2,
+      summary: {
+        examined: 1,
+        counts: expect.objectContaining({
+          'inserted': 1,
+          'unavailable-bound-group': 1,
+        }),
+      },
+    })
+    expect(await readFile(output, 'utf8')).not.toContain('imported private body')
+    expect((await stat(output)).mode & 0o777).toBe(0o600)
+
+    const second = (await collectUpdates(service(input))).at(-1)
+    expect(second).toMatchObject({
+      summary: {
+        counts: {
+          'present-primary': 1,
+          'inserted': 0,
+          'unavailable-bound-group': 1,
+        },
+      },
+    })
+  })
+
+  it('keeps completed group rows and report events after a later failure, then reruns idempotently', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const toMs = (fromSeconds + 200) * 1000
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'etm.db')
+    const output = join(directory, 'report.jsonl')
+    const database = createEtmDatabase(path)
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(1, '-1000000000043', '10', 'slave.module chat-a')
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(2, '-1000000000042', '10', 'slave.module chat-b')
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(3, '-1000000000041', '10', 'slave.module chat-c')
+    database.close()
+
+    let secondRun = false
+    const channel = (id: string) => new Api.Channel({
+      id: bigInt(id),
+      accessHash: bigInt(1),
+      title: `Bound ${id}`,
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const client = {
+      getEntity: vi.fn(async (peer: Api.TypeInputPeer) => {
+        if (peer instanceof Api.InputPeerChannel)
+          return channel(peer.channelId.toString())
+        throw new Error('unexpected peer')
+      }),
+    }
+    const getInputPeer = vi.fn(async (chatId: string | number) => {
+      if (String(chatId) === '42' && secondRun)
+        throw new Error('Could not find the input entity for {"channelId":"42","className":"PeerChannel"}')
+      return new Api.InputPeerChannel({ channelId: bigInt(String(chatId)), accessHash: bigInt(1) })
+    })
+    const takeoutMessages = vi.fn(async function* (chatId: string) {
+      if (chatId === '42') {
+        yield* []
+        throw Object.assign(new Error('500: INTERNAL (caused by messages.GetHistory)'), {
+          code: 500,
+          errorMessage: 'INTERNAL',
+        })
+      }
+      yield new Api.Message({
+        id: chatId === '43' ? 250 : 350,
+        peerId: new Api.PeerChannel({ channelId: bigInt(chatId) }),
+        fromId: new Api.PeerUser({ userId: bigInt(9) }),
+        date: fromSeconds + 1,
+        message: chatId === '43' ? 'alpha private body' : 'charlie private body',
+        replyTo: new Api.MessageReplyHeader({ replyToMsgId: 10 }),
+      })
+    })
+    const service = createRecoveryRepairService({
+      context: { emitter: new EventEmitter(), getClient: () => client } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer },
+      takeoutService: { takeoutMessages },
+    })
+    const input = {
+      etm: { backend: 'sqlite' as const, path },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: toMs,
+      chunkSize: 10,
+      outputFile: output,
+      takeout: true,
+    }
+
+    await expect(collectUpdates(service(input))).rejects.toThrow('INTERNAL')
+    let check = new DatabaseSync(path, { readOnly: true })
+    try {
+      expect(check.prepare('SELECT master_msg_id, text FROM msglog ORDER BY master_msg_id').all()).toEqual([{
+        master_msg_id: '-1000000000043.250',
+        text: 'alpha private body',
+      }])
+    }
+    finally {
+      check.close()
+    }
+    let reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'group-complete', 'run-failed'])
+    expect(reportLines[1]).toMatchObject({
+      topicChatId: '-1000000000043',
+      counts: expect.objectContaining({ inserted: 1 }),
+    })
+    expect(reportLines[2]).toMatchObject({
+      type: 'run-failed',
+      category: 'telegram-internal',
+      totalCounts: expect.objectContaining({ inserted: 1 }),
+      totalExamined: 1,
+    })
+
+    secondRun = true
+    const second = (await collectUpdates(service(input))).at(-1)
+    expect(second).toMatchObject({
+      summary: {
+        counts: {
+          'present-primary': 1,
+          'inserted': 1,
+          'unavailable-bound-group': 1,
+        },
+        examined: 2,
+      },
+    })
+    check = new DatabaseSync(path, { readOnly: true })
+    try {
+      expect(check.prepare('SELECT master_msg_id, text FROM msglog ORDER BY master_msg_id').all()).toEqual([
+        {
+          master_msg_id: '-1000000000041.350',
+          text: 'charlie private body',
+        },
+        {
+          master_msg_id: '-1000000000043.250',
+          text: 'alpha private body',
+        },
+      ])
+      expect(check.prepare('SELECT COUNT(*) AS count FROM msglog WHERE master_msg_id = ?').get('-1000000000043.250')).toEqual({ count: 1 })
+    }
+    finally {
+      check.close()
+    }
+
+    const report = await readFile(output, 'utf8')
+    expect(report).not.toContain('alpha private body')
+    expect(report).not.toContain('charlie private body')
+    reportLines = report.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(reportLines.map(line => line.type)).toEqual([
+      'run-start',
+      'group-complete',
+      'run-failed',
+      'run-start',
+      'group-complete',
+      'group-unavailable',
+      'group-complete',
+      'run-complete',
+    ])
+    expect(reportLines[5]).toMatchObject({
+      type: 'group-unavailable',
+      topicChatId: '-1000000000042',
+      sourceChatId: '42',
+      category: 'missing-input-entity',
+    })
+  })
+
+  it('reports channel-invalid bound groups without writing rows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'etm.db')
+    const output = join(directory, 'report.jsonl')
+    const database = createEtmDatabase(path)
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(1, '-1000000000042', '10', 'slave.module chat-a')
+    database.close()
+    const service = createRecoveryRepairService({
+      context: {
+        emitter: new EventEmitter(),
+        getClient: () => ({
+          getEntity: vi.fn(async () => {
+            throw Object.assign(new Error('400: CHANNEL_INVALID (caused by channels.GetChannels)'), {
+              code: 400,
+              errorMessage: 'CHANNEL_INVALID',
+            })
+          }),
+        }),
+      } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: { takeoutMessages: vi.fn() },
+    })
+
+    const last = (await collectUpdates(service({
+      etm: { backend: 'sqlite', path },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 10_000,
+      chunkSize: 10,
+      outputFile: output,
+      takeout: true,
+    }))).at(-1)
+    expect(last).toMatchObject({
+      summary: {
+        counts: {
+          'inserted': 0,
+          'unavailable-bound-group': 1,
+        },
+      },
+    })
+
+    const check = new DatabaseSync(path, { readOnly: true })
+    try {
+      expect(check.prepare('SELECT COUNT(*) AS count FROM msglog').get()).toEqual({ count: 0 })
+    }
+    finally {
+      check.close()
+    }
+
+    const report = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(report[1]).toMatchObject({
+      type: 'group-unavailable',
+      topicChatId: '-1000000000042',
+      sourceChatId: '42',
+      category: 'channel-invalid',
+    })
+  })
+
+  it('aborts transient Telegram failures without reporting an unavailable bound group', async () => {
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Bound',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const insert = vi.fn()
+    const service = createRecoveryRepairService({
+      context: {
+        emitter: new EventEmitter(),
+        getClient: () => ({ getEntity: vi.fn(async () => group) }),
+      } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: {
+        async* takeoutMessages() {
+          yield* []
+          throw Object.assign(new Error('500: INTERNAL (caused by messages.GetHistory)'), {
+            code: 500,
+            errorMessage: 'INTERNAL',
+          })
+        },
+      },
+      inspect: vi.fn(async () => ({
+        bindings: [{
+          topicChatId: '-1000000000042',
+          messageThreadId: '10',
+          slaveUid: 'slave.module chat-a',
+          slaveModule: 'slave.module',
+        }],
+      })),
+      insert,
+    })
+
+    await expect(collectUpdates(service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 10_000,
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    }))).rejects.toThrow('INTERNAL')
+    expect(insert).not.toHaveBeenCalled()
   })
 
   it('imports messages by exact topic key when one slave UID has multiple topic rows', async () => {
@@ -480,7 +865,7 @@ describe('bounded recovery repair', () => {
       })) void update
       return 'completed'
     }
-    await expect(run()).rejects.toThrow('changed during Telegram acquisition')
+    await expect(run()).rejects.toThrow('during Telegram acquisition')
     expect(insert).not.toHaveBeenCalled()
   })
 
@@ -676,5 +1061,55 @@ describe('bounded recovery repair', () => {
       expect.stringContaining('INSERT INTO msglog'),
       'COMMIT',
     ])
+  })
+
+  it('propagates database write failures after rolling back the active chunk', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const sqlitePath = join(directory, 'empty.db')
+    const binding = {
+      topicChatId: '-1000000000042',
+      messageThreadId: '10',
+      slaveUid: 'slave.module chat-a',
+      slaveModule: 'slave.module',
+    }
+    const candidate = {
+      identity: '-1000000000042.150',
+      topicChatId: '-1000000000042',
+      messageId: '150',
+      senderId: '9',
+      senderBotId: null,
+      timestamp: 150,
+      text: 'text',
+      binding,
+    }
+    await expect(
+      insertRepairCandidates({ backend: 'sqlite', path: sqlitePath }, [candidate], 1),
+    ).rejects.toThrow('no such table: msglog')
+
+    const statements: string[] = []
+    const query = vi.fn(async (query: unknown) => {
+      const sql = String(query)
+      statements.push(sql)
+      if (sql.startsWith('INSERT INTO msglog'))
+        throw new Error('postgres write failed')
+      return { rows: [], rowCount: null }
+    })
+    vi.spyOn(Pool.prototype, 'connect').mockResolvedValue({ query, release: vi.fn() } as never)
+    vi.spyOn(Pool.prototype, 'end').mockResolvedValue()
+    const password = ['test', 'credential'].join('-')
+
+    await expect(insertRepairCandidates({
+      backend: 'postgres',
+      database: 'custom',
+      host: 'db.internal',
+      port: 5544,
+      user: 'etm',
+      password,
+      maxConnections: 3,
+      staleTimeout: 999,
+      options: '-c timezone=UTC',
+    }, [candidate], 1)).rejects.toThrow('postgres write failed')
+    expect(statements).toContain('ROLLBACK')
   })
 })
