@@ -2,6 +2,8 @@ import type { Logger } from '@guiiai/logg'
 import type {
   RecoveryRepairCounts,
   RecoveryRepairInput,
+  RecoveryRepairNameSource,
+  RecoveryRepairSlaveCounts,
   RecoveryRepairSummary,
   RecoveryRepairUpdate,
 } from '@tg-search/protocol'
@@ -25,6 +27,7 @@ import { createTask } from '../utils/task'
 const BOT_API_CHANNEL_MARK = 1_000_000_000_000n
 const MAX_SIGNED_64 = 9_223_372_036_854_775_807n
 const TOPIC_COLUMNS = ['topic_chat_id', 'message_thread_id', 'slave_uid'] as const
+const SLAVE_CHAT_INFO_COLUMNS = ['id', 'slave_channel_id', 'slave_chat_uid', 'slave_chat_group_id', 'slave_chat_name'] as const
 const MSGLOG_COLUMNS = [
   'master_msg_id',
   'master_msg_id_alt',
@@ -52,8 +55,15 @@ export interface TopicBinding {
   slaveModule: string
 }
 
+export interface SlaveDisplayName {
+  slaveUid: string
+  slaveName: string
+  nameSource: RecoveryRepairNameSource
+}
+
 export interface EtmInspection {
   bindings: TopicBinding[]
+  slaveNames?: Map<string, SlaveDisplayName>
 }
 
 export interface RepairCandidate {
@@ -96,6 +106,7 @@ type ReportCandidateStatus = 'present-primary' | 'present-alt' | 'repair-attempt
 
 type EtmSource = RecoveryRepairInput['etm']
 type Presence = 'primary' | 'alternate' | 'missing'
+type InsertStatus = 'inserted' | 'concurrent' | 'conflict' | 'error'
 
 function canonicalInteger(value: unknown, label: string): string {
   const text = String(value)
@@ -138,10 +149,23 @@ export function parseEtmGroupId(value: string): { topicChatId: string, sourceCha
 }
 
 function parseSlaveModule(slaveUid: string): string {
+  return parseSlaveUid(slaveUid).module
+}
+
+function parseSlaveUid(slaveUid: string): { module: string, chatUid: string, groupId: string | null } {
   const parts = slaveUid.split(' ')
   if ((parts.length !== 2 && parts.length !== 3) || parts.some(part => part.length === 0))
     throw new Error(`Unusable ETM TopicAssoc slave_uid: ${slaveUid}`)
-  return parts[0]
+  return { module: parts[0], chatUid: parts[1], groupId: parts[2] ?? null }
+}
+
+function fallbackSlaveName(slaveUid: string): SlaveDisplayName {
+  return { slaveUid, slaveName: slaveUid, nameSource: 'slave_uid' }
+}
+
+function nonemptyName(value: unknown): string | null {
+  const name = String(value ?? '').trim()
+  return name || null
 }
 
 export function normalizeBindings(rows: Array<Record<string, unknown>>): TopicBinding[] {
@@ -180,15 +204,65 @@ function assertColumns(actual: string[], required: readonly string[], table: str
     throw new Error(`Unsupported ETM schema: ${table} is missing ${missing.join(', ')}`)
 }
 
+function hasColumns(actual: string[], required: readonly string[]): boolean {
+  return required.every(column => actual.includes(column))
+}
+
+function sqliteColumns(database: DatabaseSync, table: string): string[] {
+  return database.prepare(`PRAGMA table_info(${table})`).all().map(row => String(row.name))
+}
+
+function sqliteSlaveDisplayName(database: DatabaseSync, slaveUid: string, hasSlaveChatInfo: boolean): SlaveDisplayName {
+  const parsed = parseSlaveUid(slaveUid)
+  if (hasSlaveChatInfo) {
+    const row = database.prepare(`
+      SELECT slave_chat_name FROM slavechatinfo
+      WHERE slave_channel_id = ?
+        AND slave_chat_uid = ?
+        AND ((? IS NULL AND slave_chat_group_id IS NULL) OR slave_chat_group_id = ?)
+        AND slave_chat_name IS NOT NULL
+        AND trim(slave_chat_name) <> ''
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(parsed.module, parsed.chatUid, parsed.groupId, parsed.groupId) as { slave_chat_name?: unknown } | undefined
+    const slaveName = nonemptyName(row?.slave_chat_name)
+    if (slaveName)
+      return { slaveUid, slaveName, nameSource: 'slavechatinfo.slave_chat_name' }
+  }
+
+  const legacy = database.prepare(`
+    SELECT slave_origin_display_name FROM msglog
+    WHERE slave_origin_uid = ?
+      AND slave_origin_display_name IS NOT NULL
+      AND trim(slave_origin_display_name) <> ''
+    ORDER BY time IS NULL ASC, time DESC, master_msg_id DESC
+    LIMIT 1
+  `).get(slaveUid) as { slave_origin_display_name?: unknown } | undefined
+  const legacyName = nonemptyName(legacy?.slave_origin_display_name)
+  return legacyName
+    ? { slaveUid, slaveName: legacyName, nameSource: 'msglog.slave_origin_display_name' }
+    : fallbackSlaveName(slaveUid)
+}
+
+function sqliteSlaveDisplayNames(database: DatabaseSync, bindings: TopicBinding[]): Map<string, SlaveDisplayName> {
+  const slaveColumns = sqliteColumns(database, 'slavechatinfo')
+  const hasSlaveChatInfo = hasColumns(slaveColumns, SLAVE_CHAT_INFO_COLUMNS)
+  return new Map([...new Set(bindings.map(binding => binding.slaveUid))]
+    .sort()
+    .map(slaveUid => [slaveUid, sqliteSlaveDisplayName(database, slaveUid, hasSlaveChatInfo)]))
+}
+
 function inspectSqlite(path: string): EtmInspection {
   const database = new DatabaseSync(path, { readOnly: true })
   try {
-    const topicColumns = database.prepare('PRAGMA table_info(topicassoc)').all().map(row => String(row.name))
-    const msgLogColumns = database.prepare('PRAGMA table_info(msglog)').all().map(row => String(row.name))
+    const topicColumns = sqliteColumns(database, 'topicassoc')
+    const msgLogColumns = sqliteColumns(database, 'msglog')
     assertColumns(topicColumns, TOPIC_COLUMNS, 'topicassoc')
     assertColumns(msgLogColumns, MSGLOG_COLUMNS, 'msglog')
+    const bindings = normalizeBindings(database.prepare('SELECT topic_chat_id, message_thread_id, slave_uid FROM topicassoc').all() as Array<Record<string, unknown>>)
     return {
-      bindings: normalizeBindings(database.prepare('SELECT topic_chat_id, message_thread_id, slave_uid FROM topicassoc').all() as Array<Record<string, unknown>>),
+      bindings,
+      slaveNames: sqliteSlaveDisplayNames(database, bindings),
     }
   }
   finally {
@@ -212,6 +286,47 @@ function createPostgresPool(source: Extract<EtmSource, { backend: 'postgres' }>)
   return new Pool(postgresPoolConfig(source))
 }
 
+async function postgresSlaveDisplayName(client: PoolClient, slaveUid: string, hasSlaveChatInfo: boolean): Promise<SlaveDisplayName> {
+  const parsed = parseSlaveUid(slaveUid)
+  if (hasSlaveChatInfo) {
+    const rows = await client.query<{ slave_chat_name: string }>(
+      `SELECT slave_chat_name FROM slavechatinfo
+       WHERE slave_channel_id = $1
+         AND slave_chat_uid = $2
+         AND (($3::text IS NULL AND slave_chat_group_id IS NULL) OR slave_chat_group_id = $3)
+         AND slave_chat_name IS NOT NULL
+         AND trim(slave_chat_name) <> ''
+       ORDER BY id DESC
+       LIMIT 1`,
+      [parsed.module, parsed.chatUid, parsed.groupId],
+    )
+    const slaveName = nonemptyName(rows.rows[0]?.slave_chat_name)
+    if (slaveName)
+      return { slaveUid, slaveName, nameSource: 'slavechatinfo.slave_chat_name' }
+  }
+
+  const legacy = await client.query<{ slave_origin_display_name: string }>(
+    `SELECT slave_origin_display_name FROM msglog
+     WHERE slave_origin_uid = $1
+       AND slave_origin_display_name IS NOT NULL
+       AND trim(slave_origin_display_name) <> ''
+     ORDER BY time IS NULL ASC, time DESC, master_msg_id DESC
+     LIMIT 1`,
+    [slaveUid],
+  )
+  const legacyName = nonemptyName(legacy.rows[0]?.slave_origin_display_name)
+  return legacyName
+    ? { slaveUid, slaveName: legacyName, nameSource: 'msglog.slave_origin_display_name' }
+    : fallbackSlaveName(slaveUid)
+}
+
+async function postgresSlaveDisplayNames(client: PoolClient, bindings: TopicBinding[], hasSlaveChatInfo: boolean): Promise<Map<string, SlaveDisplayName>> {
+  const slaveNames = new Map<string, SlaveDisplayName>()
+  for (const slaveUid of [...new Set(bindings.map(binding => binding.slaveUid))].sort())
+    slaveNames.set(slaveUid, await postgresSlaveDisplayName(client, slaveUid, hasSlaveChatInfo))
+  return slaveNames
+}
+
 async function inspectPostgres(source: Extract<EtmSource, { backend: 'postgres' }>): Promise<EtmInspection> {
   const pool = createPostgresPool(source)
   const client = await pool.connect()
@@ -219,13 +334,19 @@ async function inspectPostgres(source: Extract<EtmSource, { backend: 'postgres' 
     await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
     const columns = await client.query<{ table_name: string, column_name: string }>(
       `SELECT table_name, column_name FROM information_schema.columns
-       WHERE table_schema = current_schema() AND table_name IN ('topicassoc', 'msglog')`,
+       WHERE table_schema = current_schema() AND table_name IN ('topicassoc', 'msglog', 'slavechatinfo')`,
     )
     assertColumns(columns.rows.filter(row => row.table_name === 'topicassoc').map(row => row.column_name), TOPIC_COLUMNS, 'topicassoc')
     assertColumns(columns.rows.filter(row => row.table_name === 'msglog').map(row => row.column_name), MSGLOG_COLUMNS, 'msglog')
     const rows = await client.query('SELECT topic_chat_id, message_thread_id, slave_uid FROM topicassoc')
+    const bindings = normalizeBindings(rows.rows)
+    const slaveNames = await postgresSlaveDisplayNames(
+      client,
+      bindings,
+      hasColumns(columns.rows.filter(row => row.table_name === 'slavechatinfo').map(row => row.column_name), SLAVE_CHAT_INFO_COLUMNS),
+    )
     await client.query('COMMIT')
-    return { bindings: normalizeBindings(rows.rows) }
+    return { bindings, slaveNames }
   }
   catch (error) {
     await client.query('ROLLBACK').catch(() => {})
@@ -245,6 +366,10 @@ export function inspectEtm(source: EtmSource): Promise<EtmInspection> {
 
 function sameBindings(left: TopicBinding[], right: TopicBinding[]): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function inspectionSlaveNames(inspection: EtmInspection): Map<string, SlaveDisplayName> {
+  return inspection.slaveNames ?? new Map()
 }
 
 function rawPeerId(peer: Api.TypePeer): string | undefined {
@@ -392,7 +517,13 @@ export async function readInitialPresences(source: EtmSource, identities: string
   }
 }
 
-interface InsertOutcome { inserted: number, concurrent: number, conflicts: number, errors: number }
+interface InsertOutcome {
+  inserted: number
+  concurrent: number
+  conflicts: number
+  errors: number
+  statuses?: Map<string, InsertStatus>
+}
 
 function insertSqliteChunk(path: string, chunk: RepairCandidate[]): InsertOutcome {
   const database = new DatabaseSync(path)
@@ -404,20 +535,26 @@ function insertSqliteChunk(path: string, chunk: RepairCandidate[]): InsertOutcom
     let inserted = 0
     let concurrent = 0
     let conflicts = 0
+    const statuses = new Map<string, InsertStatus>()
     for (const candidate of chunk) {
       if (sqlitePresence(database, candidate.identity) !== 'missing') {
         concurrent += 1
+        statuses.set(candidate.identity, 'concurrent')
         continue
       }
       const result = insert.run(...rowValues(candidate))
-      if (result.changes === 1)
+      if (result.changes === 1) {
         inserted += 1
-      else
+        statuses.set(candidate.identity, 'inserted')
+      }
+      else {
         conflicts += 1
+        statuses.set(candidate.identity, 'conflict')
+      }
     }
     database.exec('COMMIT')
     transaction = false
-    return { inserted, concurrent, conflicts, errors: 0 }
+    return { inserted, concurrent, conflicts, errors: 0, statuses }
   }
   catch (error) {
     if (transaction)
@@ -439,19 +576,25 @@ async function insertPostgresChunk(source: Extract<EtmSource, { backend: 'postgr
     let inserted = 0
     let concurrent = 0
     let conflicts = 0
+    const statuses = new Map<string, InsertStatus>()
     for (const candidate of chunk) {
       if ((presences.get(candidate.identity) ?? 'missing') !== 'missing') {
         concurrent += 1
+        statuses.set(candidate.identity, 'concurrent')
         continue
       }
       const result = await client.query(POSTGRES_INSERT_SQL, rowValues(candidate))
-      if (result.rowCount === 1)
+      if (result.rowCount === 1) {
         inserted += 1
-      else
+        statuses.set(candidate.identity, 'inserted')
+      }
+      else {
         conflicts += 1
+        statuses.set(candidate.identity, 'conflict')
+      }
     }
     await client.query('COMMIT')
-    return { inserted, concurrent, conflicts, errors: 0 }
+    return { inserted, concurrent, conflicts, errors: 0, statuses }
   }
   catch (error) {
     await client.query('ROLLBACK').catch(() => {})
@@ -464,7 +607,7 @@ async function insertPostgresChunk(source: Extract<EtmSource, { backend: 'postgr
 }
 
 export async function insertRepairCandidates(source: EtmSource, candidates: RepairCandidate[], chunkSize: number): Promise<InsertOutcome> {
-  const total: InsertOutcome = { inserted: 0, concurrent: 0, conflicts: 0, errors: 0 }
+  const total: InsertOutcome = { inserted: 0, concurrent: 0, conflicts: 0, errors: 0, statuses: new Map() }
   for (let index = 0; index < candidates.length; index += chunkSize) {
     const chunk = candidates.slice(index, index + chunkSize)
     const outcome = source.backend === 'sqlite'
@@ -474,6 +617,8 @@ export async function insertRepairCandidates(source: EtmSource, candidates: Repa
     total.concurrent += outcome.concurrent
     total.conflicts += outcome.conflicts
     total.errors += outcome.errors
+    for (const [identity, status] of outcome.statuses ?? [])
+      total.statuses?.set(identity, status)
   }
   return total
 }
@@ -498,6 +643,43 @@ function addCounts(total: RecoveryRepairCounts, next: RecoveryRepairCounts) {
     total[key] += next[key]
 }
 
+function emptySlaveCounts(): RecoveryRepairSlaveCounts {
+  return {
+    mappedExamined: 0,
+    eligible: 0,
+    presentPrimary: 0,
+    presentAlt: 0,
+    inserted: 0,
+    concurrent: 0,
+    conflicts: 0,
+    errors: 0,
+    skipped: {
+      'human-or-unconfigured-sender': 0,
+      'service-deleted-unusable': 0,
+    },
+  }
+}
+
+function slaveCounts(countsBySlave: Map<string, RecoveryRepairSlaveCounts>, slaveUid: string): RecoveryRepairSlaveCounts {
+  const existing = countsBySlave.get(slaveUid)
+  if (existing)
+    return existing
+  const counts = emptySlaveCounts()
+  countsBySlave.set(slaveUid, counts)
+  return counts
+}
+
+function addSlaveInsertStatus(counts: RecoveryRepairSlaveCounts, status: InsertStatus | undefined) {
+  if (status === 'inserted')
+    counts.inserted += 1
+  else if (status === 'concurrent')
+    counts.concurrent += 1
+  else if (status === 'conflict')
+    counts.conflicts += 1
+  else if (status === 'error')
+    counts.errors += 1
+}
+
 function bindingsForGroup(bindings: TopicBinding[], topicChatId: string): TopicBinding[] {
   return bindings.filter(binding => binding.topicChatId === topicChatId).sort(compareBindings)
 }
@@ -515,11 +697,12 @@ function buildGroupCandidates(
   messages: Iterable<AcquiredMessage>,
   bindings: Map<string, TopicBinding>,
   roles: Map<string, string | null>,
-): { candidates: RepairCandidate[], counts: RecoveryRepairCounts } {
+): { candidates: RepairCandidate[], counts: RecoveryRepairCounts, slaveCounts: Map<string, RecoveryRepairSlaveCounts> } {
   const counts = emptyCounts()
+  const countsBySlave = new Map<string, RecoveryRepairSlaveCounts>()
   const candidates: RepairCandidate[] = []
   for (const message of [...messages].sort(compareMessages)) {
-    if (!message.senderId || !message.topicId || !message.text.trim()) {
+    if (!message.topicId) {
       counts['service-deleted-unusable'] += 1
       continue
     }
@@ -528,10 +711,19 @@ function buildGroupCandidates(
       counts['unbound-topic'] += 1
       continue
     }
-    if (!roles.has(message.senderId)) {
-      counts['human-or-unconfigured-sender'] += 1
+    const perSlave = slaveCounts(countsBySlave, binding.slaveUid)
+    perSlave.mappedExamined += 1
+    if (!message.senderId || !message.text.trim()) {
+      counts['service-deleted-unusable'] += 1
+      perSlave.skipped['service-deleted-unusable'] += 1
       continue
     }
+    if (!roles.has(message.senderId)) {
+      counts['human-or-unconfigured-sender'] += 1
+      perSlave.skipped['human-or-unconfigured-sender'] += 1
+      continue
+    }
+    perSlave.eligible += 1
     candidates.push({
       identity: `${message.topicChatId}.${message.messageId}`,
       topicChatId: message.topicChatId,
@@ -543,19 +735,30 @@ function buildGroupCandidates(
       binding,
     })
   }
-  return { candidates, counts }
+  return { candidates, counts, slaveCounts: countsBySlave }
 }
 
-function splitCandidatesByPresence(candidates: RepairCandidate[], presences: Map<string, Presence>, counts: RecoveryRepairCounts): RepairCandidate[] {
+function splitCandidatesByPresence(
+  candidates: RepairCandidate[],
+  presences: Map<string, Presence>,
+  counts: RecoveryRepairCounts,
+  countsBySlave: Map<string, RecoveryRepairSlaveCounts>,
+): RepairCandidate[] {
   const missing: RepairCandidate[] = []
   for (const candidate of candidates) {
     const presence = presences.get(candidate.identity) ?? 'missing'
-    if (presence === 'primary')
+    const perSlave = slaveCounts(countsBySlave, candidate.binding.slaveUid)
+    if (presence === 'primary') {
       counts['present-primary'] += 1
-    else if (presence === 'alternate')
+      perSlave.presentPrimary += 1
+    }
+    else if (presence === 'alternate') {
       counts['present-alt'] += 1
-    else
+      perSlave.presentAlt += 1
+    }
+    else {
       missing.push(candidate)
+    }
   }
   return missing
 }
@@ -567,6 +770,15 @@ function applyInsertOutcome(counts: RecoveryRepairCounts, outcome: InsertOutcome
   counts.errors = outcome.errors
 }
 
+function applySlaveInsertOutcome(
+  candidates: RepairCandidate[],
+  outcome: InsertOutcome,
+  countsBySlave: Map<string, RecoveryRepairSlaveCounts>,
+) {
+  for (const candidate of candidates)
+    addSlaveInsertStatus(slaveCounts(countsBySlave, candidate.binding.slaveUid), outcome.statuses?.get(candidate.identity))
+}
+
 function reportCandidate(candidate: RepairCandidate, presences: Map<string, Presence>) {
   return {
     identity: candidate.identity,
@@ -576,6 +788,53 @@ function reportCandidate(candidate: RepairCandidate, presences: Map<string, Pres
     topicId: candidate.binding.messageThreadId,
     status: candidateStatus(candidate, presences),
   }
+}
+
+function compareSlaveIdentity(left: { slaveName: string, slaveUid: string }, right: { slaveName: string, slaveUid: string }): number {
+  const name = left.slaveName.localeCompare(right.slaveName)
+  return name || left.slaveUid.localeCompare(right.slaveUid)
+}
+
+function buildSlaveSummaryEvents(
+  taskId: string,
+  topicChatId: string,
+  slaveNames: Map<string, SlaveDisplayName>,
+  countsBySlave: Map<string, RecoveryRepairSlaveCounts>,
+): Array<RecoveryRepairUpdate & { type: 'slave-summary' }> {
+  return [...countsBySlave.entries()].map(([slaveUid, counts]) => {
+    const displayName = slaveNames.get(slaveUid) ?? fallbackSlaveName(slaveUid)
+    return {
+      type: 'slave-summary',
+      taskId,
+      version: 2,
+      topicChatId,
+      slaveUid,
+      slaveName: displayName.slaveName,
+      nameSource: displayName.nameSource,
+      counts,
+    } as const
+  }).sort(compareSlaveIdentity)
+}
+
+function unavailableBindingReports(
+  bindings: TopicBinding[],
+  slaveNames: Map<string, SlaveDisplayName>,
+) {
+  return bindings.map((binding) => {
+    const displayName = slaveNames.get(binding.slaveUid) ?? fallbackSlaveName(binding.slaveUid)
+    return {
+      messageThreadId: binding.messageThreadId,
+      slaveUid: binding.slaveUid,
+      slaveName: displayName.slaveName,
+      nameSource: displayName.nameSource,
+    }
+  }).sort((left, right) => {
+    const identity = compareSlaveIdentity(left, right)
+    if (identity)
+      return identity
+    const topic = BigInt(left.messageThreadId) - BigInt(right.messageThreadId)
+    return topic < 0n ? -1 : topic > 0n ? 1 : 0
+  })
 }
 
 async function appendReportEvent(path: string, event: Record<string, unknown>) {
@@ -726,18 +985,29 @@ export function createRecoveryRepairService(options: {
             sourceChatId: group.sourceChatId,
             category,
           } satisfies UnavailableBoundGroup
+          const unavailableBindings = unavailableBindingReports(
+            bindingsForGroup(before.bindings, group.topicChatId),
+            inspectionSlaveNames(before),
+          )
+          const unavailableEvent = {
+            type: 'group-unavailable',
+            taskId,
+            version: 2,
+            ...unavailableGroup,
+            bindingCount: unavailableBindings.length,
+            bindings: unavailableBindings,
+          } as const
           counts['unavailable-bound-group'] += 1
           logger.withFields(unavailableGroup).warn('Skipping unavailable ETM bound group')
           if (input.outputFile) {
             await appendReportEvent(input.outputFile, {
-              type: 'group-unavailable',
-              version: 2,
               runId: taskId,
-              ...unavailableGroup,
+              ...unavailableEvent,
               totalCounts: counts,
               totalExamined: examined,
             })
           }
+          yield unavailableEvent
           yield { type: 'progress', taskId, topicChatId: group.topicChatId, sourceChatId: group.sourceChatId, examined }
           continue
         }
@@ -754,19 +1024,34 @@ export function createRecoveryRepairService(options: {
         const bindings = new Map(currentGroupBindings.map(binding => [`${binding.topicChatId}.${binding.messageThreadId}`, binding]))
         const groupResult = buildGroupCandidates(groupMessages.values(), bindings, roles)
         const presences = await presenceReader(input.etm, groupResult.candidates.map(candidate => candidate.identity))
-        const missing = splitCandidatesByPresence(groupResult.candidates, presences, groupResult.counts)
+        const missing = splitCandidatesByPresence(groupResult.candidates, presences, groupResult.counts, groupResult.slaveCounts)
         const outcome = await inserter(input.etm, missing, input.chunkSize)
         applyInsertOutcome(groupResult.counts, outcome)
+        applySlaveInsertOutcome(missing, outcome, groupResult.slaveCounts)
         addCounts(counts, groupResult.counts)
         examined += groupMessages.size
+        const slaveSummaries = buildSlaveSummaryEvents(
+          taskId,
+          group.topicChatId,
+          inspectionSlaveNames(afterGroup),
+          groupResult.slaveCounts,
+        )
+        const groupComplete = {
+          type: 'group-complete',
+          taskId,
+          version: 2,
+          topicChatId: group.topicChatId,
+          sourceChatId: group.sourceChatId,
+          slaveCount: slaveSummaries.length,
+          mappedExamined: slaveSummaries.reduce((total, event) => total + event.counts.mappedExamined, 0),
+        } as const
 
         if (input.outputFile) {
+          for (const event of slaveSummaries)
+            await appendReportEvent(input.outputFile, { runId: taskId, ...event })
           await appendReportEvent(input.outputFile, {
-            type: 'group-complete',
-            version: 2,
             runId: taskId,
-            topicChatId: group.topicChatId,
-            sourceChatId: group.sourceChatId,
+            ...groupComplete,
             counts: groupResult.counts,
             totalCounts: counts,
             examined: groupMessages.size,
@@ -775,6 +1060,9 @@ export function createRecoveryRepairService(options: {
           })
         }
 
+        for (const event of slaveSummaries)
+          yield event
+        yield groupComplete
         yield { type: 'progress', taskId, topicChatId: group.topicChatId, sourceChatId: group.sourceChatId, examined }
       }
 

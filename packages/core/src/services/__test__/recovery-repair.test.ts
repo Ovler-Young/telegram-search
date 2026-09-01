@@ -45,6 +45,13 @@ function createEtmDatabase(path: string) {
   const database = new DatabaseSync(path)
   database.exec(`
     CREATE TABLE topicassoc (id INTEGER PRIMARY KEY, topic_chat_id TEXT, message_thread_id TEXT, slave_uid TEXT);
+    CREATE TABLE slavechatinfo (
+      id INTEGER PRIMARY KEY,
+      slave_channel_id TEXT NOT NULL,
+      slave_chat_uid TEXT NOT NULL,
+      slave_chat_group_id TEXT,
+      slave_chat_name TEXT
+    );
     CREATE TABLE msglog (
       master_msg_id TEXT PRIMARY KEY,
       master_msg_id_alt TEXT,
@@ -66,6 +73,21 @@ function createEtmDatabase(path: string) {
     );
   `)
   return database
+}
+
+function insertSlaveName(database: DatabaseSync, id: number, slaveUid: string, name: string | null) {
+  const [slaveChannelId, slaveChatUid, slaveChatGroupId = null] = slaveUid.split(' ')
+  database.prepare(`INSERT INTO slavechatinfo (
+    id, slave_channel_id, slave_chat_uid, slave_chat_group_id, slave_chat_name
+  ) VALUES (?, ?, ?, ?, ?)`).run(id, slaveChannelId, slaveChatUid, slaveChatGroupId, name)
+}
+
+function insertLegacySlaveName(database: DatabaseSync, masterId: string, slaveUid: string, name: string) {
+  database.prepare(`INSERT INTO msglog (
+    master_msg_id, master_msg_id_alt, slave_message_id, text, slave_origin_uid,
+    slave_origin_display_name, slave_member_uid, media_type, msg_type, sent_to, time
+  ) VALUES (?, NULL, 'live', 'live', ?, ?, 'slave.module member', 'Text', 'Text', 'blueset.telegram', '2026-01-01')`)
+    .run(masterId, slaveUid, name)
 }
 
 function insertExisting(database: DatabaseSync, primary: string, alternate: string | null, senderBotId: string | null = null) {
@@ -126,6 +148,11 @@ describe('eTM discovery and bot identity', () => {
 
     await expect(inspectEtm({ backend: 'sqlite', path })).resolves.toEqual({
       bindings: [{ topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a', slaveModule: 'slave.module' }],
+      slaveNames: new Map([['slave.module chat-a', {
+        slaveUid: 'slave.module chat-a',
+        slaveName: 'slave.module chat-a',
+        nameSource: 'slave_uid',
+      }]]),
     })
     await expect(readInitialPresences({ backend: 'sqlite', path }, [
       '-1000000000042.11',
@@ -136,6 +163,106 @@ describe('eTM discovery and bot identity', () => {
       ['-1000000000042.12', 'alternate'],
       ['-1000000000042.13', 'missing'],
     ]))
+  })
+
+  it('resolves SQLite slave display names from SlaveChatInfo before MsgLog fallback', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'etm.db')
+    const database = createEtmDatabase(path)
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(1, '-1000000000042', '10', 'slave.module chat-a')
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(2, '-1000000000042', '11', 'slave.module chat-b')
+    database.prepare('INSERT INTO topicassoc VALUES (?, ?, ?, ?)').run(3, '-1000000000042', '12', 'slave.module chat-c room-1')
+    insertSlaveName(database, 1, 'slave.module chat-a', 'Old Alpha')
+    insertSlaveName(database, 2, 'slave.module chat-a', '')
+    insertSlaveName(database, 3, 'slave.module chat-a', 'Current Alpha')
+    insertLegacySlaveName(database, '-1000000000042.1', 'slave.module chat-b', 'Legacy Beta')
+    database.close()
+
+    const inspected = await inspectEtm({ backend: 'sqlite', path })
+    expect(inspected.slaveNames).toEqual(new Map([
+      ['slave.module chat-a', {
+        slaveUid: 'slave.module chat-a',
+        slaveName: 'Current Alpha',
+        nameSource: 'slavechatinfo.slave_chat_name',
+      }],
+      ['slave.module chat-b', {
+        slaveUid: 'slave.module chat-b',
+        slaveName: 'Legacy Beta',
+        nameSource: 'msglog.slave_origin_display_name',
+      }],
+      ['slave.module chat-c room-1', {
+        slaveUid: 'slave.module chat-c room-1',
+        slaveName: 'slave.module chat-c room-1',
+        nameSource: 'slave_uid',
+      }],
+    ]))
+  })
+
+  it('resolves PostgreSQL slave display names from the inspected ETM schema', async () => {
+    const columns = {
+      topicassoc: ['topic_chat_id', 'message_thread_id', 'slave_uid'],
+      slavechatinfo: ['id', 'slave_channel_id', 'slave_chat_uid', 'slave_chat_group_id', 'slave_chat_name'],
+      msglog: [
+        'master_msg_id',
+        'master_msg_id_alt',
+        'slave_message_id',
+        'text',
+        'slave_origin_uid',
+        'slave_origin_display_name',
+        'slave_member_uid',
+        'slave_member_display_name',
+        'media_type',
+        'mime',
+        'file_id',
+        'file_unique_id',
+        'msg_type',
+        'pickle',
+        'sent_to',
+        'sender_bot_id',
+        'time',
+      ],
+    }
+    const query = vi.fn(async (query: unknown) => {
+      const sql = String(query)
+      if (sql.startsWith('SELECT table_name, column_name')) {
+        return {
+          rows: Object.entries(columns).flatMap(([table_name, names]) =>
+            names.map(column_name => ({ table_name, column_name }))),
+        }
+      }
+      if (sql.startsWith('SELECT topic_chat_id')) {
+        return {
+          rows: [{ topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' }],
+        }
+      }
+      if (sql.startsWith('SELECT slave_chat_name'))
+        return { rows: [{ slave_chat_name: 'Postgres Alpha' }] }
+      if (sql.startsWith('SELECT slave_origin_display_name'))
+        return { rows: [] }
+      return { rows: [], rowCount: null }
+    })
+    vi.spyOn(Pool.prototype, 'connect').mockResolvedValue({ query, release: vi.fn() } as never)
+    vi.spyOn(Pool.prototype, 'end').mockResolvedValue()
+    const password = ['test', 'credential'].join('-')
+
+    const inspected = await inspectEtm({
+      backend: 'postgres',
+      database: 'custom',
+      host: 'db.internal',
+      port: 5544,
+      user: 'etm',
+      password,
+      maxConnections: 3,
+      staleTimeout: 999,
+      options: '-c timezone=UTC',
+    })
+    expect(inspected.bindings).toMatchObject([{ topicChatId: '-1000000000042', messageThreadId: '10', slaveUid: 'slave.module chat-a' }])
+    expect(inspected.slaveNames).toEqual(new Map([['slave.module chat-a', {
+      slaveUid: 'slave.module chat-a',
+      slaveName: 'Postgres Alpha',
+      nameSource: 'slavechatinfo.slave_chat_name',
+    }]]))
   })
 
   it.runIf(Boolean(process.env.RECOVERY_REPAIR_POSTGRES_URL))('validates the configured real PostgreSQL ETM schema', async () => {
@@ -332,6 +459,177 @@ describe('bounded recovery repair', () => {
     expect(second).toMatchObject({ summary: { counts: { 'present-primary': 3, 'present-alt': 1, 'inserted': 0 } } })
   })
 
+  it('reports mapped counts for each corresponding ETM slave without message bodies', async () => {
+    const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
+    const toMs = (fromSeconds + 200) * 1000
+    const directory = await mkdtemp(join(tmpdir(), 'tg-repair-'))
+    temporaryDirectories.push(directory)
+    const output = join(directory, 'report.jsonl')
+    const group = new Api.Channel({
+      id: bigInt(42),
+      accessHash: bigInt(1),
+      title: 'Bound',
+      photo: new Api.ChatPhotoEmpty(),
+      date: 0,
+      megagroup: true,
+    })
+    const bindings = normalizeBindings([
+      { topic_chat_id: '-1000000000042', message_thread_id: '10', slave_uid: 'slave.module chat-a' },
+      { topic_chat_id: '-1000000000042', message_thread_id: '11', slave_uid: 'slave.module chat-a' },
+      { topic_chat_id: '-1000000000042', message_thread_id: '12', slave_uid: 'slave.module chat-b' },
+    ])
+    const slaveNames = new Map([
+      ['slave.module chat-a', {
+        slaveUid: 'slave.module chat-a',
+        slaveName: 'Alpha Room',
+        nameSource: 'slavechatinfo.slave_chat_name' as const,
+      }],
+      ['slave.module chat-b', {
+        slaveUid: 'slave.module chat-b',
+        slaveName: 'Beta Room',
+        nameSource: 'slavechatinfo.slave_chat_name' as const,
+      }],
+    ])
+    const message = (id: number, sender: number, text: string, topicId: number) => new Api.Message({
+      id,
+      peerId: new Api.PeerChannel({ channelId: bigInt(42) }),
+      fromId: new Api.PeerUser({ userId: bigInt(sender) }),
+      date: fromSeconds + id,
+      message: text,
+      replyTo: new Api.MessageReplyHeader({ replyToMsgId: topicId }),
+    })
+    const service = createRecoveryRepairService({
+      context: {
+        emitter: new EventEmitter(),
+        getClient: () => ({ getEntity: vi.fn(async () => group) }),
+      } as unknown as CoreContext,
+      logger: logger(),
+      entityService: { getInputPeer: vi.fn(async () => new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })) },
+      takeoutService: {
+        async* takeoutMessages() {
+          yield message(100, 9, 'alpha present primary body', 10)
+          yield message(101, 9, 'alpha present alternate body', 11)
+          yield message(102, 9, 'alpha inserted body', 10)
+          yield message(103, 11, 'alpha human body', 11)
+          yield message(104, 10, 'beta inserted body', 12)
+          yield message(105, 11, 'beta human body', 12)
+          yield message(106, 9, 'unbound body', 99)
+          yield message(107, 9, '', 10)
+        },
+      },
+      inspect: vi.fn(async () => ({ bindings, slaveNames })),
+      presences: vi.fn(async () => new Map([
+        ['-1000000000042.100', 'primary' as const],
+        ['-1000000000042.101', 'alternate' as const],
+      ])),
+      insert: vi.fn(async () => ({
+        inserted: 2,
+        concurrent: 0,
+        conflicts: 0,
+        errors: 0,
+        statuses: new Map([
+          ['-1000000000042.102', 'inserted' as const],
+          ['-1000000000042.104', 'inserted' as const],
+        ]),
+      })),
+    })
+
+    const updates = await collectUpdates(service({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: ['10'],
+      startedAtMs: toMs,
+      chunkSize: 10,
+      outputFile: output,
+      takeout: true,
+    }))
+    const summaries = updates.filter(update => update.type === 'slave-summary')
+    expect(summaries).toMatchObject([
+      {
+        type: 'slave-summary',
+        taskId: expect.any(String),
+        version: 2,
+        topicChatId: '-1000000000042',
+        slaveUid: 'slave.module chat-a',
+        slaveName: 'Alpha Room',
+        nameSource: 'slavechatinfo.slave_chat_name',
+        counts: {
+          mappedExamined: 5,
+          eligible: 3,
+          presentPrimary: 1,
+          presentAlt: 1,
+          inserted: 1,
+          concurrent: 0,
+          conflicts: 0,
+          errors: 0,
+          skipped: {
+            'human-or-unconfigured-sender': 1,
+            'service-deleted-unusable': 1,
+          },
+        },
+      },
+      {
+        type: 'slave-summary',
+        taskId: expect.any(String),
+        version: 2,
+        topicChatId: '-1000000000042',
+        slaveUid: 'slave.module chat-b',
+        slaveName: 'Beta Room',
+        nameSource: 'slavechatinfo.slave_chat_name',
+        counts: {
+          mappedExamined: 2,
+          eligible: 1,
+          presentPrimary: 0,
+          presentAlt: 0,
+          inserted: 1,
+          concurrent: 0,
+          conflicts: 0,
+          errors: 0,
+          skipped: {
+            'human-or-unconfigured-sender': 1,
+            'service-deleted-unusable': 0,
+          },
+        },
+      },
+    ])
+    expect(updates.find(update => update.type === 'group-complete')).toMatchObject({
+      slaveCount: 2,
+      mappedExamined: 7,
+    })
+    expect(updates.at(-1)).toMatchObject({
+      summary: {
+        counts: {
+          'present-primary': 1,
+          'present-alt': 1,
+          'inserted': 2,
+          'unbound-topic': 1,
+          'human-or-unconfigured-sender': 2,
+          'service-deleted-unusable': 1,
+        },
+        examined: 8,
+      },
+    })
+
+    const report = await readFile(output, 'utf8')
+    const reportLines = report.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'slave-summary', 'slave-summary', 'group-complete', 'run-complete'])
+    expect(reportLines[3]).toMatchObject({
+      type: 'group-complete',
+      slaveCount: 2,
+      mappedExamined: 7,
+      examined: 8,
+      candidates: [
+        expect.objectContaining({ identity: '-1000000000042.100', status: 'present-primary' }),
+        expect.objectContaining({ identity: '-1000000000042.101', status: 'present-alt' }),
+        expect.objectContaining({ identity: '-1000000000042.102', status: 'repair-attempted' }),
+        expect.objectContaining({ identity: '-1000000000042.104', status: 'repair-attempted' }),
+      ],
+    })
+    expect(report).not.toContain('alpha inserted body')
+    expect(report).not.toContain('beta inserted body')
+    expect(report).not.toContain('alpha human body')
+  })
+
   it('skips a stale bound group while importing accessible messages and reporting safe metadata', async () => {
     const fromSeconds = Date.parse(RECOVERY_REPAIR_FROM_ISO) / 1000
     const toMs = (fromSeconds + 200) * 1000
@@ -415,7 +713,7 @@ describe('bounded recovery repair', () => {
     }
 
     const reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(reportLines).toHaveLength(5)
+    expect(reportLines).toHaveLength(6)
     expect(reportLines[0]).toEqual({ type: 'prior-run' })
     expect(reportLines[1]).toMatchObject({ type: 'run-start', version: 2, groups: ['-1000000000043', '-1000000000042'] })
     expect(reportLines[2]).toMatchObject({
@@ -424,20 +722,35 @@ describe('bounded recovery repair', () => {
       topicChatId: '-1000000000043',
       sourceChatId: '43',
       category: 'missing-input-entity',
+      bindingCount: 1,
+      bindings: [{
+        messageThreadId: '10',
+        slaveUid: 'slave.module chat-b',
+        slaveName: 'slave.module chat-b',
+        nameSource: 'slave_uid',
+      }],
       totalCounts: expect.objectContaining({ 'unavailable-bound-group': 1 }),
     })
     expect(reportLines[3]).toMatchObject({
+      type: 'slave-summary',
+      topicChatId: '-1000000000042',
+      slaveUid: 'slave.module chat-a',
+      counts: expect.objectContaining({ inserted: 1, mappedExamined: 1 }),
+    })
+    expect(reportLines[4]).toMatchObject({
       type: 'group-complete',
       version: 2,
       topicChatId: '-1000000000042',
       sourceChatId: '42',
+      slaveCount: 1,
+      mappedExamined: 1,
       counts: expect.objectContaining({ inserted: 1 }),
       candidates: [expect.objectContaining({
         identity: '-1000000000042.150',
         status: 'repair-attempted',
       })],
     })
-    expect(reportLines[4]).toMatchObject({
+    expect(reportLines[5]).toMatchObject({
       type: 'run-complete',
       version: 2,
       summary: {
@@ -542,12 +855,18 @@ describe('bounded recovery repair', () => {
       check.close()
     }
     let reportLines = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'group-complete', 'run-failed'])
+    expect(reportLines.map(line => line.type)).toEqual(['run-start', 'slave-summary', 'group-complete', 'run-failed'])
     expect(reportLines[1]).toMatchObject({
+      type: 'slave-summary',
+      topicChatId: '-1000000000043',
+      slaveUid: 'slave.module chat-a',
+      counts: expect.objectContaining({ inserted: 1, mappedExamined: 1 }),
+    })
+    expect(reportLines[2]).toMatchObject({
       topicChatId: '-1000000000043',
       counts: expect.objectContaining({ inserted: 1 }),
     })
-    expect(reportLines[2]).toMatchObject({
+    expect(reportLines[3]).toMatchObject({
       type: 'run-failed',
       category: 'telegram-internal',
       totalCounts: expect.objectContaining({ inserted: 1 }),
@@ -590,15 +909,18 @@ describe('bounded recovery repair', () => {
     reportLines = report.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
     expect(reportLines.map(line => line.type)).toEqual([
       'run-start',
+      'slave-summary',
       'group-complete',
       'run-failed',
       'run-start',
+      'slave-summary',
       'group-complete',
       'group-unavailable',
+      'slave-summary',
       'group-complete',
       'run-complete',
     ])
-    expect(reportLines[5]).toMatchObject({
+    expect(reportLines[7]).toMatchObject({
       type: 'group-unavailable',
       topicChatId: '-1000000000042',
       sourceChatId: '42',
@@ -658,11 +980,19 @@ describe('bounded recovery repair', () => {
     }
 
     const report = (await readFile(output, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(report.map(line => line.type)).toEqual(['run-start', 'group-unavailable', 'run-complete'])
     expect(report[1]).toMatchObject({
       type: 'group-unavailable',
       topicChatId: '-1000000000042',
       sourceChatId: '42',
       category: 'channel-invalid',
+      bindingCount: 1,
+      bindings: [{
+        messageThreadId: '10',
+        slaveUid: 'slave.module chat-a',
+        slaveName: 'slave.module chat-a',
+        nameSource: 'slave_uid',
+      }],
     })
   })
 
@@ -1043,7 +1373,7 @@ describe('bounded recovery repair', () => {
     })
     expect(postgresPoolConfig(source)).not.toHaveProperty('idleTimeoutMillis')
 
-    await expect(insertRepairCandidates(source, [{
+    const outcome = await insertRepairCandidates(source, [{
       identity: '-1000000000042.150',
       topicChatId: '-1000000000042',
       messageId: '150',
@@ -1052,7 +1382,9 @@ describe('bounded recovery repair', () => {
       timestamp: 150,
       text: 'text',
       binding,
-    }], 1)).resolves.toEqual({ inserted: 1, concurrent: 0, conflicts: 0, errors: 0 })
+    }], 1)
+    expect(outcome).toMatchObject({ inserted: 1, concurrent: 0, conflicts: 0, errors: 0 })
+    expect(outcome.statuses).toEqual(new Map([['-1000000000042.150', 'inserted']]))
 
     expect(statements).toEqual([
       'BEGIN',

@@ -45,6 +45,23 @@ export interface RecoveryRepairCounts {
   'errors': number
 }
 
+export interface RecoveryRepairSlaveCounts {
+  mappedExamined: number
+  eligible: number
+  presentPrimary: number
+  presentAlt: number
+  inserted: number
+  concurrent: number
+  conflicts: number
+  errors: number
+  skipped: {
+    'human-or-unconfigured-sender': number
+    'service-deleted-unusable': number
+  }
+}
+
+export type RecoveryRepairNameSource = 'slavechatinfo.slave_chat_name' | 'msglog.slave_origin_display_name' | 'slave_uid'
+
 export interface RecoveryRepairSummary {
   version: 1
   backend: 'sqlite' | 'postgres'
@@ -59,6 +76,39 @@ export interface RecoveryRepairSummary {
 export type RecoveryRepairUpdate
   = | { type: 'started', taskId: string }
     | { type: 'progress', taskId: string, topicChatId: string, sourceChatId: string, examined: number }
+    | {
+      type: 'slave-summary'
+      taskId: string
+      version: 2
+      topicChatId: string
+      slaveUid: string
+      slaveName: string
+      nameSource: RecoveryRepairNameSource
+      counts: RecoveryRepairSlaveCounts
+    }
+    | {
+      type: 'group-complete'
+      taskId: string
+      version: 2
+      topicChatId: string
+      sourceChatId: string
+      slaveCount: number
+      mappedExamined: number
+    }
+    | {
+      type: 'group-unavailable'
+      taskId: string
+      version: 2
+      topicChatId: string
+      sourceChatId: string
+      bindingCount: number
+      bindings: Array<{
+        messageThreadId: string
+        slaveUid: string
+        slaveName: string
+        nameSource: RecoveryRepairNameSource
+      }>
+    }
     | { type: 'completed', summary: RecoveryRepairSummary, file: string | null }
     | { type: 'failed', taskId: string, error: AppError }
 
