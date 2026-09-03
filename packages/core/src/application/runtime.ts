@@ -42,6 +42,7 @@ import { createRemoteMessagesService } from '../services/remote-messages'
 import { createStatsAccumulator } from '../services/stats'
 import { createTakeoutService } from '../services/takeout'
 import { convertToCoreMessage } from '../utils/message'
+import { withTimeout } from '../utils/promise'
 import { createTask } from '../utils/task'
 import { appResult, toAppError } from './errors'
 
@@ -51,6 +52,8 @@ function takeoutFailure(error: unknown, message: string): AppError {
     return classified
   return { code: 'TAKEOUT_FAILED', message, retryable: false }
 }
+
+const RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS = 120_000
 
 export interface TelegramApplication {
   listChats: (input: ListChatsInput) => Promise<AppResult<CursorPage<ChatRecord>>>
@@ -312,8 +315,23 @@ export function createTelegramApplicationRuntime(options: {
   }
 
   async function* repairRecovery(input: RecoveryRepairInput, signal?: AbortSignal): AsyncGenerator<RecoveryRepairUpdate> {
-    const { createRecoveryRepairService } = await import('../services/recovery-repair')
-    yield* createRecoveryRepairService({ context, logger, entityService, takeoutService })(input, signal)
+    let taskId = uuidv4()
+    try {
+      await withTimeout(
+        fetchAndPersistDialogs(),
+        RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS,
+        `Recovery Telegram dialog refresh timed out after ${RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS}ms`,
+      )
+      const { createRecoveryRepairService } = await import('../services/recovery-repair')
+      for await (const update of createRecoveryRepairService({ context, logger, entityService, takeoutService })(input, signal)) {
+        if (update.type === 'started')
+          taskId = update.taskId
+        yield update
+      }
+    }
+    catch (error) {
+      yield { type: 'failed', taskId, error: toAppError(error) }
+    }
   }
 
   return {

@@ -731,6 +731,155 @@ describe('takeout service', () => {
     }
   })
 
+  it('ends a recovery-scoped export when a Telegram read remains pending', async () => {
+    vi.useFakeTimers()
+    const client = {
+      invoke: vi.fn((query: any) => {
+        if (query instanceof Api.account.InitTakeoutSession)
+          return Promise.resolve({ id: bigInt(99) })
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.messages.GetSplitRanges)
+          return new Promise(() => {})
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.account.FinishTakeoutSession)
+          return Promise.resolve({})
+        throw new Error('unexpected query')
+      }),
+    }
+
+    try {
+      const { ctx } = createMockCtx(client)
+      const service = createTakeoutService(ctx, logger, mockChatModels, mockChatMessageStatsModels, mockEntityService)
+      const task = createTask()
+      task.updateProgress = vi.fn()
+      task.updateError = vi.fn()
+      const collectPromise = (async () => {
+        for await (const _message of service.takeoutMessages('123', {
+          pagination: { limit: 100, offset: 0 },
+          skipMedia: true,
+          task,
+          expectedCount: 1,
+          disableAutoProgress: true,
+          takeoutConsent: true,
+          requestTimeoutMs: 100,
+        })) {
+          // The timed-out request does not produce messages.
+        }
+      })()
+
+      await vi.advanceTimersByTimeAsync(100)
+      await collectPromise
+
+      expect(task.updateError).toHaveBeenCalledWith(expect.objectContaining({
+        message: 'Takeout split-range request timed out after 100ms',
+      }))
+      const finishes = client.invoke.mock.calls
+        .map(([query]) => query)
+        .filter(query => query instanceof Api.InvokeWithTakeout && query.query instanceof Api.account.FinishTakeoutSession)
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0].query.success).toBe(false)
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries takeout cleanup once when successful finalization is rejected', async () => {
+    const finishOutcomes: boolean[] = []
+    const client = {
+      invoke: vi.fn((query: Api.AnyRequest) => {
+        if (query instanceof Api.account.InitTakeoutSession)
+          return Promise.resolve({ id: bigInt(99) })
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.messages.GetSplitRanges)
+          return Promise.resolve([])
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.messages.GetHistory)
+          return Promise.resolve({ messages: [] })
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.account.FinishTakeoutSession) {
+          finishOutcomes.push(query.query.success ?? false)
+          return query.query.success
+            ? Promise.reject(new Error('finish rejected'))
+            : Promise.resolve({})
+        }
+        throw new Error('unexpected query')
+      }),
+    }
+    const { ctx } = createMockCtx(client)
+    const service = createTakeoutService(ctx, logger, mockChatModels, mockChatMessageStatsModels, mockEntityService)
+    const task = createTask()
+    task.updateError = vi.fn()
+
+    for await (const _message of service.takeoutMessages('123', {
+      pagination: { limit: 100, offset: 0 },
+      skipMedia: true,
+      task,
+      expectedCount: 0,
+      disableAutoProgress: true,
+      takeoutConsent: true,
+      requestTimeoutMs: 100,
+    })) {
+      // Finalization fails after message iteration has completed.
+    }
+
+    expect(task.updateError).toHaveBeenCalledWith(expect.objectContaining({ message: 'finish rejected' }))
+    expect(finishOutcomes).toEqual([true, false])
+  })
+
+  it('does not overlap takeout finalization when the finish request times out', async () => {
+    vi.useFakeTimers()
+    const finishOutcomes: boolean[] = []
+    let resolveFinish: (() => void) | undefined
+    const client = {
+      invoke: vi.fn((query: Api.AnyRequest) => {
+        if (query instanceof Api.account.InitTakeoutSession)
+          return Promise.resolve({ id: bigInt(99) })
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.messages.GetSplitRanges)
+          return Promise.resolve([])
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.messages.GetHistory)
+          return Promise.resolve({ messages: [] })
+        if (query instanceof Api.InvokeWithTakeout && query.query instanceof Api.account.FinishTakeoutSession) {
+          finishOutcomes.push(query.query.success ?? false)
+          return new Promise<void>((resolve) => {
+            resolveFinish = resolve
+          })
+        }
+        throw new Error('unexpected query')
+      }),
+    }
+
+    try {
+      const { ctx } = createMockCtx(client)
+      const service = createTakeoutService(ctx, logger, mockChatModels, mockChatMessageStatsModels, mockEntityService)
+      const task = createTask()
+      task.updateError = vi.fn()
+      const collectPromise = (async () => {
+        for await (const _message of service.takeoutMessages('123', {
+          pagination: { limit: 100, offset: 0 },
+          skipMedia: true,
+          task,
+          expectedCount: 0,
+          disableAutoProgress: true,
+          takeoutConsent: true,
+          requestTimeoutMs: 100,
+        })) {
+          // No messages are available in this session.
+        }
+      })()
+
+      await vi.advanceTimersByTimeAsync(100)
+      await collectPromise
+
+      expect(task.updateError).toHaveBeenCalledWith(expect.objectContaining({
+        message: 'Takeout finish request timed out after 100ms',
+      }))
+      expect(finishOutcomes).toEqual([true])
+
+      resolveFinish?.()
+      await Promise.resolve()
+      expect(finishOutcomes).toEqual([true])
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('takeoutMessages should not report 100% success when initialization fails', async () => {
     const client = {
       invoke: vi.fn(async (query: any) => {

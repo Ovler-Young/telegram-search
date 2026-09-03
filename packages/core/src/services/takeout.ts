@@ -17,7 +17,7 @@ import { Api } from 'telegram'
 import { MESSAGE_PROCESS_BATCH_SIZE, TELEGRAM_HISTORY_INTERVAL_MS } from '../constants'
 import { CoreEventType } from '../types/events'
 import { createMinIntervalWaiter } from '../utils/min-interval'
-import { waitForEvent } from '../utils/promise'
+import { PromiseTimeoutError, waitForEvent, withTimeout } from '../utils/promise'
 import { createTask } from '../utils/task'
 
 export type TakeoutService = ReturnType<typeof createTakeoutService>
@@ -40,6 +40,12 @@ export function createTakeoutService(
 
   // Abortable min-interval waiter shared within this service
   const waitHistoryInterval = createMinIntervalWaiter(TELEGRAM_HISTORY_INTERVAL_MS)
+
+  async function withRequestTimeout<T>(operation: Promise<T>, timeoutMs: number | undefined, label: string): Promise<T> {
+    if (timeoutMs === undefined)
+      return operation
+    return withTimeout(operation, timeoutMs, `${label} timed out after ${timeoutMs}ms`)
+  }
 
   /**
    * Normalize potentially stringly-typed IDs coming from DB drivers or external inputs.
@@ -66,12 +72,16 @@ export function createTakeoutService(
    * https://core.telegram.org/api/takeout
    * https://core.telegram.org/method/messages.getSplitRanges
    */
-  async function getSplitRanges(takeout: Api.account.Takeout): Promise<Api.MessageRange[]> {
+  async function getSplitRanges(takeout: Api.account.Takeout, requestTimeoutMs?: number): Promise<Api.MessageRange[]> {
     return withSpan('takeout:getSplitRanges', async () => {
-      const ranges = await retryTelegramRead(() => ctx.getClient().invoke(new Api.InvokeWithTakeout({
-        takeoutId: takeout.id,
-        query: new Api.messages.GetSplitRanges(),
-      }))) as Api.MessageRange[]
+      const ranges = await withRequestTimeout(
+        retryTelegramRead(() => ctx.getClient().invoke(new Api.InvokeWithTakeout({
+          takeoutId: takeout.id,
+          query: new Api.messages.GetSplitRanges(),
+        }))) as Promise<Api.MessageRange[]>,
+        requestTimeoutMs,
+        'Takeout split-range request',
+      )
       logger.withFields({ rangeCount: ranges.length }).log('Fetched split ranges')
       return ranges
     })
@@ -79,7 +89,7 @@ export function createTakeoutService(
 
   const TAKEOUT_INIT_TIMEOUT_MS = 30_000
 
-  async function resolveTakeoutMessageFlags(chatId: string, inputPeer?: Api.TypeInputPeer) {
+  async function resolveTakeoutMessageFlags(chatId: string, inputPeer?: Api.TypeInputPeer, requestTimeoutMs?: number) {
     const peer = inputPeer ?? await entityService.getInputPeer(chatId)
     if (peer instanceof Api.InputPeerUser) {
       return { messageUsers: true }
@@ -90,7 +100,11 @@ export function createTakeoutService(
       return { messageChats: true, messageMegagroups: true }
     }
     if (peer instanceof Api.InputPeerChannel) {
-      const entity = await ctx.getClient().getEntity(peer)
+      const entity = await withRequestTimeout(
+        ctx.getClient().getEntity(peer),
+        requestTimeoutMs,
+        'Takeout entity resolution',
+      )
       if (entity instanceof Api.Channel && entity.megagroup)
         return { messageMegagroups: true }
       return { messageChannels: true }
@@ -98,10 +112,10 @@ export function createTakeoutService(
     throw new Error(`Unsupported Telegram peer for takeout: ${peer.className}`)
   }
 
-  async function initTakeout(chatId: string, inputPeer?: Api.TypeInputPeer): Promise<Api.account.Takeout> {
+  async function initTakeout(chatId: string, inputPeer?: Api.TypeInputPeer, requestTimeoutMs?: number): Promise<Api.account.Takeout> {
     return withSpan('takeout:initSession', async () => {
       logger.log('Initializing takeout session...')
-      const messageFlags = await resolveTakeoutMessageFlags(chatId, inputPeer)
+      const messageFlags = await resolveTakeoutMessageFlags(chatId, inputPeer, requestTimeoutMs)
 
       const invokePromise = ctx.getClient().invoke(new Api.account.InitTakeoutSession({
         contacts: false,
@@ -159,14 +173,18 @@ export function createTakeoutService(
     })
   }
 
-  async function finishTakeout(takeout: Api.account.Takeout, success: boolean) {
+  async function finishTakeout(takeout: Api.account.Takeout, success: boolean, requestTimeoutMs?: number) {
     return withSpan('takeout:finishSession', () => {
-      return ctx.getClient().invoke(new Api.InvokeWithTakeout({
-        takeoutId: takeout.id,
-        query: new Api.account.FinishTakeoutSession({
-          success,
-        }),
-      }))
+      return withRequestTimeout(
+        ctx.getClient().invoke(new Api.InvokeWithTakeout({
+          takeoutId: takeout.id,
+          query: new Api.account.FinishTakeoutSession({
+            success,
+          }),
+        })),
+        requestTimeoutMs,
+        'Takeout finish request',
+      )
     }, { success })
   }
 
@@ -294,7 +312,11 @@ export function createTakeoutService(
       const query = buildInvokeQuery(historyQuery, takeoutSession, range)
       const fetchStart = performance.now()
       const result = await withSpan('takeout:fetchPage', () => {
-        return retryTelegramRead(() => ctx.getClient().invoke(query) as unknown as Promise<Api.messages.MessagesSlice>)
+        return withRequestTimeout(
+          retryTelegramRead(() => ctx.getClient().invoke(query) as unknown as Promise<Api.messages.MessagesSlice>),
+          options.requestTimeoutMs,
+          'Takeout history request',
+        )
       }, {
         chatId,
         offsetId,
@@ -390,14 +412,14 @@ export function createTakeoutService(
 
     let takeoutSession: Api.account.Takeout
     try {
-      takeoutSession = await initTakeout(chatId, options.inputPeer)
+      takeoutSession = await initTakeout(chatId, options.inputPeer, options.requestTimeoutMs)
     }
     catch (error) {
       task.updateError(error)
       return
     }
 
-    let sessionFinished = false
+    let sessionNeedsCleanup = true
     try {
       // Only emit initial progress if auto-progress is enabled
       if (!options.disableAutoProgress) {
@@ -412,7 +434,7 @@ export function createTakeoutService(
       // Fetch split ranges so we iterate every message box on the server.
       // Without this, messages beyond the 500K/1M boundaries may be missed.
       // https://core.telegram.org/api/takeout
-      const splitRanges = await getSplitRanges(takeoutSession)
+      const splitRanges = await getSplitRanges(takeoutSession, options.requestTimeoutMs)
       logger.withFields({ splitRangeCount: splitRanges.length }).log('Using split ranges for message fetch')
 
       if (splitRanges.length > 0) {
@@ -438,8 +460,17 @@ export function createTakeoutService(
       }
 
       const completed = !task.state.abortController.signal.aborted && !task.state.lastError
-      await finishTakeout(takeoutSession, completed)
-      sessionFinished = true
+      try {
+        await finishTakeout(takeoutSession, completed, options.requestTimeoutMs)
+        sessionNeedsCleanup = false
+      }
+      catch (error) {
+        // A timed-out request is still running in GramJS and may finish later.
+        // Starting another finish request could overlap it.
+        if (error instanceof PromiseTimeoutError)
+          sessionNeedsCleanup = false
+        throw error
+      }
 
       if (task.state.abortController.signal.aborted) {
         // Task was aborted, handler layer already updated task status
@@ -464,9 +495,9 @@ export function createTakeoutService(
       task.updateError(errorToEmit)
     }
     finally {
-      if (!sessionFinished) {
+      if (sessionNeedsCleanup) {
         try {
-          await finishTakeout(takeoutSession, false)
+          await finishTakeout(takeoutSession, false, options.requestTimeoutMs)
         }
         catch (finishError) {
           logger.withError(finishError).warn('Failed to finish unsuccessful takeout session')

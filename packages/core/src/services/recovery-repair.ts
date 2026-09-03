@@ -22,6 +22,7 @@ import { Pool } from 'pg'
 import { Api } from 'telegram'
 import { v4 as uuidv4 } from 'uuid'
 
+import { withTimeout } from '../utils/promise'
 import { createTask } from '../utils/task'
 
 const BOT_API_CHANNEL_MARK = 1_000_000_000_000n
@@ -49,6 +50,7 @@ const MSGLOG_COLUMNS = [
 ] as const
 const ACQUISITION_PROGRESS_INTERVAL = 10_000
 const HEARTBEAT_INTERVAL_MS = 60_000
+const RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS = 120_000
 
 interface IteratorHeartbeat {
   kind: 'heartbeat'
@@ -59,6 +61,14 @@ interface IteratorHeartbeat {
 interface IteratorValue<T> {
   kind: 'value'
   value: T
+}
+
+async function withRecoveryTelegramTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  return withTimeout(
+    operation,
+    RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS,
+    `Recovery Telegram ${label} timed out after ${RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS}ms`,
+  )
 }
 
 async function* withIteratorHeartbeat<T>(source: AsyncIterable<T>): AsyncGenerator<IteratorHeartbeat | IteratorValue<T>> {
@@ -149,7 +159,6 @@ export interface AcquiredMessage {
 
 type UnavailableBoundGroupCategory
   = | 'broadcast-channel'
-    | 'missing-input-entity'
     | 'channel-invalid'
     | 'channel-private'
     | 'channel-public-group-na'
@@ -618,14 +627,6 @@ const UNAVAILABLE_RPC_ERRORS = new Map<string, UnavailableBoundGroupCategory>([
 function classifyUnavailableBoundGroup(error: unknown): UnavailableBoundGroupCategory | undefined {
   if (error instanceof UnavailableRecoveryGroupError)
     return error.category
-  const message = error instanceof Error ? error.message : String(error)
-  if (
-    message.startsWith('Could not find the input entity for ')
-    || message.startsWith('Cannot find any entity corresponding to ')
-  ) {
-    return 'missing-input-entity'
-  }
-
   const rpcMessage = typeof error === 'object' && error && 'errorMessage' in error
     ? String((error as { errorMessage?: unknown }).errorMessage)
     : undefined
@@ -1093,6 +1094,7 @@ async function* discoverHistoricalTopicBinding(
       expectedCount: 0,
       disableAutoProgress: true,
       takeoutConsent,
+      requestTimeoutMs: RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS,
       task,
     })
     for await (const item of withIteratorHeartbeat(messages)) {
@@ -1325,9 +1327,15 @@ export function createRecoveryRepairService(options: {
         const abortTask = () => task.abort()
         signal?.addEventListener('abort', abortTask, { once: true })
         try {
-          inputPeer = await entityService.getInputPeer(group.sourceChatId)
+          inputPeer = await withRecoveryTelegramTimeout(
+            entityService.getInputPeer(group.sourceChatId),
+            'group peer resolution',
+          )
           assertGroupInputPeer(group, inputPeer)
-          const entity = await context.getClient().getEntity(inputPeer)
+          const entity = await withRecoveryTelegramTimeout(
+            context.getClient().getEntity(inputPeer),
+            'group entity resolution',
+          )
           if (group.expectedPeer === 'channel' && entity instanceof Api.Channel && entity.id.toString() === group.sourceChatId && !entity.megagroup) {
             throw new UnavailableRecoveryGroupError('broadcast-channel', `Recovery group ${group.topicChatId} is a broadcast channel`)
           }
@@ -1345,6 +1353,7 @@ export function createRecoveryRepairService(options: {
             expectedCount: 0,
             disableAutoProgress: true,
             takeoutConsent: input.takeout,
+            requestTimeoutMs: RECOVERY_TELEGRAM_OPERATION_TIMEOUT_MS,
             task,
           })
           for await (const item of withIteratorHeartbeat(messages)) {

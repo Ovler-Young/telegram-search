@@ -193,6 +193,14 @@ export type RecoveryRepairUpdate
       version: 2
       topicChatId: string
       sourceChatId: string
+      category:
+        | 'broadcast-channel'
+        | 'channel-invalid'
+        | 'channel-private'
+        | 'channel-public-group-na'
+        | 'chat-id-invalid'
+        | 'peer-id-invalid'
+        | 'user-not-participant'
       bindingCount: number
       bindings: Array<{
         messageThreadId: string

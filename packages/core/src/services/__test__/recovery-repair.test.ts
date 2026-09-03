@@ -1257,7 +1257,7 @@ describe('bounded recovery repair', () => {
     const getInputPeer = vi.fn(async (chatId: string | number) => {
       if (String(chatId) === '42')
         return new Api.InputPeerChannel({ channelId: bigInt(42), accessHash: bigInt(1) })
-      throw new Error('Could not find the input entity for {"channelId":"43","className":"PeerChannel"}')
+      throw Object.assign(new Error('400: CHANNEL_PRIVATE'), { errorMessage: 'CHANNEL_PRIVATE' })
     })
     const takeoutMessages = vi.fn(async function* () {
       yield new Api.Message({
@@ -1323,7 +1323,7 @@ describe('bounded recovery repair', () => {
       version: 2,
       topicChatId: '-1000000000043',
       sourceChatId: '43',
-      category: 'missing-input-entity',
+      category: 'channel-private',
       bindingCount: 1,
       bindings: [{
         messageThreadId: '10',
@@ -1379,7 +1379,8 @@ describe('bounded recovery repair', () => {
     })
   })
 
-  it('skips an inaccessible historical MsgLog group without requiring a current TopicAssoc row', async () => {
+  it('does not present a missing local input entity as a verified unavailable group', async () => {
+    // A local entity-cache miss does not establish whether the account can access the group.
     const takeoutMessages = vi.fn()
     const service = createRecoveryRepairService({
       context: { emitter: new EventEmitter(), getClient: vi.fn() } as unknown as CoreContext,
@@ -1394,7 +1395,7 @@ describe('bounded recovery repair', () => {
       historicalGroups: vi.fn(async () => ['-1000000000042']),
     })
 
-    const updates = await collectUpdates(service({
+    await expect(collectUpdates(service({
       etm: { backend: 'sqlite', path: '/unused' },
       mainBotId: '9',
       auxiliaryBotIds: [],
@@ -1402,17 +1403,9 @@ describe('bounded recovery repair', () => {
       chunkSize: 10,
       outputFile: null,
       takeout: true,
-    }))
+    }))).rejects.toThrow('Could not find the input entity')
 
     expect(takeoutMessages).not.toHaveBeenCalled()
-    expect(updates).toContainEqual(expect.objectContaining({
-      type: 'group-unavailable',
-      topicChatId: '-1000000000042',
-      category: 'missing-input-entity',
-      bindingCount: 0,
-      bindings: [],
-    }))
-    expect(updates.at(-1)).toMatchObject({ summary: { counts: { 'unavailable-bound-group': 1 } } })
   })
 
   it('skips a historical broadcast channel while preserving earlier and later group repairs', async () => {
@@ -1541,7 +1534,7 @@ describe('bounded recovery repair', () => {
     }
     const getInputPeer = vi.fn(async (chatId: string | number) => {
       if (String(chatId) === '42' && secondRun)
-        throw new Error('Could not find the input entity for {"channelId":"42","className":"PeerChannel"}')
+        throw Object.assign(new Error('400: CHANNEL_PRIVATE'), { errorMessage: 'CHANNEL_PRIVATE' })
       return new Api.InputPeerChannel({ channelId: bigInt(String(chatId)), accessHash: bigInt(1) })
     })
     const takeoutMessages = vi.fn(async function* (chatId: string) {
@@ -1663,7 +1656,7 @@ describe('bounded recovery repair', () => {
       type: 'group-unavailable',
       topicChatId: '-1000000000042',
       sourceChatId: '42',
-      category: 'missing-input-entity',
+      category: 'channel-private',
     })
   })
 

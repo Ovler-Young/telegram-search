@@ -483,6 +483,10 @@ export interface TakeoutOpts {
 
   // Bulk history export is allowed only after explicit user consent.
   takeoutConsent: boolean
+
+  // Bound each Telegram request made for recovery so a reconnected transport
+  // cannot leave the recovery stream pending indefinitely.
+  requestTimeoutMs?: number
 }
 
 // ============================================================================

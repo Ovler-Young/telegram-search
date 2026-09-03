@@ -7,6 +7,7 @@ import type { TakeoutService } from '../services/takeout'
 
 import bigInt from 'big-integer'
 
+import { RECOVERY_REPAIR_FROM_ISO } from '@tg-search/protocol'
 import { Api } from 'telegram'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -83,6 +84,60 @@ function createHarness(messages: Api.Message[] = []) {
 }
 
 describe('telegram application runtime remote boundaries', () => {
+  it('refreshes and persists dialogs before recovery resolves ETM groups', async () => {
+    // GramJS needs dialog entities loaded so numeric channel IDs include access hashes.
+    const harness = createHarness()
+    const runtime = createTelegramApplicationRuntime(harness)
+    const stream = runtime.repairRecovery!({
+      etm: { backend: 'sqlite', path: '/unused' },
+      mainBotId: '9',
+      auxiliaryBotIds: [],
+      startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 1,
+      chunkSize: 10,
+      outputFile: null,
+      takeout: true,
+    })
+
+    await expect(stream.next()).resolves.toMatchObject({ value: { type: 'started' } })
+    expect(harness.getDialogs).toHaveBeenCalledWith({})
+    expect(harness.recordChats).toHaveBeenCalledWith(
+      expect.anything(),
+      [expect.objectContaining({ id: 42, accessHash: '99' })],
+      'account-1',
+    )
+    await stream.return(undefined)
+  })
+
+  it('reports a failed recovery update when dialog refresh remains pending', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = createHarness()
+      harness.getDialogs.mockImplementation(() => new Promise(() => {}))
+      const runtime = createTelegramApplicationRuntime(harness)
+      const pending = runtime.repairRecovery!({
+        etm: { backend: 'sqlite', path: '/unused' },
+        mainBotId: '9',
+        auxiliaryBotIds: [],
+        startedAtMs: Date.parse(RECOVERY_REPAIR_FROM_ISO) + 1,
+        chunkSize: 10,
+        outputFile: null,
+        takeout: true,
+      }).next()
+
+      await vi.advanceTimersByTimeAsync(120_000)
+
+      await expect(pending).resolves.toMatchObject({
+        value: {
+          type: 'failed',
+          error: { message: 'Recovery Telegram dialog refresh timed out after 120000ms' },
+        },
+      })
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('lists dialogs without the epoch offset and persists their access hashes', async () => {
     const harness = createHarness()
     const runtime = createTelegramApplicationRuntime(harness)
